@@ -801,15 +801,16 @@ select_nodes_and_auth() {
 
 select_output() {
     echo -e "\n${CYAN}${BOLD}[2/2] Output Destination${NC}"
-    echo -e "  ${GREEN}1)${NC} Local ${DIM}(stay on each node)${NC}  ${GREEN}2)${NC} Node ${DIM}(collect to one node)${NC}  ${GREEN}3)${NC} Google Drive  ${GREEN}4)${NC} FTP"
-    read -p "  Choice [1-4]: " oc
+    echo -e "  ${GREEN}1)${NC} Google Drive ${DIM}(default)${NC}  ${GREEN}2)${NC} Node ${DIM}(collect to one node)${NC}  ${GREEN}3)${NC} Local ${DIM}(stay on each node)${NC}  ${GREEN}4)${NC} FTP"
+    read -p "  Choice [1-4] (default: 1): " oc
+    oc="${oc:-1}"
     case "$oc" in
-        1) OUTPUT_MODE="local" ;;
-        2) OUTPUT_MODE="node"
-           read -p "  Collection node IP: " COLLECT_NODE ;;
-        3) OUTPUT_MODE="gdrive"
+        1) OUTPUT_MODE="gdrive"
            read -p "  Drive folder [${GDRIVE_FOLDER}]: " gf
            GDRIVE_FOLDER="${gf:-$GDRIVE_FOLDER}" ;;
+        2) OUTPUT_MODE="node"
+           read -p "  Collection node IP: " COLLECT_NODE ;;
+        3) OUTPUT_MODE="local" ;;
         4) OUTPUT_MODE="ftp"
            read -p "  FTP host: " FTP_HOST; read -p "  FTP user: " FTP_USER
            read -sp "  FTP password: " FTP_PASS; echo ""

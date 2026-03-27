@@ -753,17 +753,18 @@ select_dc_name() {
 
 select_output_mode() {
     echo -e "\n${CYAN}${BOLD}[2/2] Output Destination${NC}"
-    echo -e "  ${GREEN}1)${NC} Local ${DIM}(stay on each node)${NC}  ${GREEN}2)${NC} Node ${DIM}(scp to one node)${NC}  ${GREEN}3)${NC} Google Drive  ${GREEN}4)${NC} NFS  ${GREEN}5)${NC} FTP"
-    read -p "  Choice [1-5]: " oc
+    echo -e "  ${GREEN}1)${NC} Google Drive ${DIM}(default)${NC}  ${GREEN}2)${NC} Node ${DIM}(scp to one node)${NC}  ${GREEN}3)${NC} Local ${DIM}(stay on each node)${NC}  ${GREEN}4)${NC} NFS  ${GREEN}5)${NC} FTP"
+    read -p "  Choice [1-5] (default: 1): " oc
+    oc="${oc:-1}"
     case "$oc" in
-        1) OUTPUT_MODE="local" ;;
+        1) OUTPUT_MODE="gdrive"
+           read -p "  Drive folder [${GDRIVE_FOLDER}]: " gf
+           GDRIVE_FOLDER="${gf:-$GDRIVE_FOLDER}" ;;
         2) OUTPUT_MODE="node"
            echo -e "  ${DIM}Enter hostname (e.g. g329) or public IP${NC}"
            read -p "  Collection node: " COLLECT_NODE; COLLECT_USER="root"
            COLLECT_PATH="/root/Reports/thermal-results"; export COLLECT_NODE COLLECT_USER COLLECT_PATH ;;
-        3) OUTPUT_MODE="gdrive"
-           read -p "  Drive folder [${GDRIVE_FOLDER}]: " gf
-           GDRIVE_FOLDER="${gf:-$GDRIVE_FOLDER}" ;;
+        3) OUTPUT_MODE="local" ;;
         4) OUTPUT_MODE="nfs"; read -p "  NFS server: " NFS_SERVER; read -p "  NFS path: " NFS_PATH
            export NFS_SERVER NFS_PATH ;;
         5) OUTPUT_MODE="ftp"; read -p "  FTP host: " FTP_HOST; read -p "  FTP user: " FTP_USER
