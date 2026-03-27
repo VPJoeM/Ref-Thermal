@@ -1,0 +1,72 @@
+# Template -- placeholders replaced by thermal-k8s-manager.sh at runtime
+# __NODE_NAME__, __JOB_NAME__, __RUN_ID__, __ALTITUDE__, __OUTPUT_MODE__,
+# __DC_NAME__, __IMAGE__, __GPU_COUNT__
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  namespace: thermal-diagnostics
+  labels:
+    app: thermal-diagnostics
+    thermal-run: "__RUN_ID__"
+spec:
+  ttlSecondsAfterFinished: 1800
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: thermal-diagnostics
+        thermal-run: "__RUN_ID__"
+    spec:
+      nodeName: __NODE_NAME__
+      restartPolicy: Never
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: thermal-diag
+        image: __IMAGE__
+        imagePullPolicy: Never
+        securityContext:
+          privileged: true
+        env:
+        - name: altitude_ft
+          value: "__ALTITUDE__"
+        - name: OUTPUT_MODE
+          value: "__OUTPUT_MODE__"
+        - name: DC_NAME
+          value: "__DC_NAME__"
+        - name: NON_INTERACTIVE
+          value: "true"
+        # __EXTRA_ENV__
+        resources:
+          limits:
+            nvidia.com/gpu: __GPU_COUNT__
+        volumeMounts:
+        - name: ipmi
+          mountPath: /dev/ipmi0
+        - name: tdas
+          mountPath: /root/TDAS
+        - name: results
+          mountPath: /results
+        - name: host-ssh
+          mountPath: /root/.ssh
+          readOnly: true
+      volumes:
+      - name: ipmi
+        hostPath:
+          path: /dev/ipmi0
+          type: CharDevice
+      - name: tdas
+        hostPath:
+          path: /root/TDAS
+          type: DirectoryOrCreate
+      - name: results
+        # __VOLUME_RESULTS__
+        hostPath:
+          path: /root/TDAS/k8s-results
+      - name: host-ssh
+        hostPath:
+          path: /root/.ssh
+          type: DirectoryOrCreate
