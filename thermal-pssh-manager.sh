@@ -939,30 +939,20 @@ run_diagnostics_menu() {
             echo -e "  ${GREEN}✓${NC} All delivery paths verified"
             ;;
         gdrive)
-            echo -e "\n  ${CYAN}Testing Google Drive access from ${NODE_IPS[0]}...${NC}"
-            # install rclone temporarily for test, push key, test listing
-            local gtest_node="${NODE_IPS[0]}"
-            local has_rc
-            has_rc=$(ssh_cmd "$gtest_node" "which rclone 2>/dev/null")
-            if [[ -z "$has_rc" ]]; then
-                ssh_cmd "$gtest_node" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null
+            echo -e "\n  ${CYAN}Testing Google Drive credentials...${NC}"
+            # just verify the password decrypts the SA key correctly
+            if [[ -z "$GDRIVE_PASS" ]]; then
+                read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
             fi
-            push_gdrive_sa_key "$gtest_node"
-            local gtest
-            gtest=$(ssh_cmd "$gtest_node" "sudo rclone lsd ':drive:' \
-                --drive-service-account-file /tmp/.gdrive-sa.json \
-                --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
-                --drive-scope drive 2>&1" | head -3)
-            ssh_cmd "$gtest_node" "sudo rm -f /tmp/.gdrive-sa.json"
-            [[ -z "$has_rc" ]] && ssh_cmd "$gtest_node" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
-
-            if [[ $? -eq 0 ]] && ! echo "$gtest" | grep -qi "error\|failed\|denied"; then
-                echo -e "  ${GREEN}✓${NC} Google Drive accessible from ${gtest_node}"
-            else
-                log_error "Cannot access Google Drive from ${gtest_node}"
-                echo -e "     ${DIM}${gtest}${NC}"
+            local test_json
+            test_json=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
+            if [[ $? -ne 0 || -z "$test_json" ]]; then
+                log_error "Wrong Google Drive password"
+                GDRIVE_PASS=""
                 return 1
             fi
+            echo "$GDRIVE_PASS" > "$GDRIVE_PASS_FILE" && chmod 600 "$GDRIVE_PASS_FILE"
+            echo -e "  ${GREEN}✓${NC} Google Drive credentials OK"
             ;;
         ftp)
             echo -e "\n  ${CYAN}Testing FTP connection...${NC}"
