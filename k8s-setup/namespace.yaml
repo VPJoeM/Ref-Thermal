@@ -1,6 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: thermal-diagnostics
-  labels:
-    purpose: gpu-thermal-testing
