@@ -726,8 +726,8 @@ select_nodes_and_auth() {
     echo -e "${CYAN}${BOLD}[1/2] Nodes & SSH Access${NC}"
 
     # SSH user
-    read -p "  SSH username: " SSH_USER
-    [[ -z "$SSH_USER" ]] && { log_error "Username required"; return 1; }
+    read -p "  SSH username [ubuntu]: " SSH_USER
+    SSH_USER="${SSH_USER:-ubuntu}"
 
     # SSH key -- scan and present menu
     local keys=()
