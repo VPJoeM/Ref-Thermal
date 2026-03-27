@@ -799,6 +799,23 @@ run_diagnostics_menu() {
     read -p "  Ready to go? (Y/n): " lc
     [[ "$lc" =~ ^[Nn]$ ]] && { echo "Cancelled."; return 0; }
 
+    # preflight: verify Google Drive credentials if gdrive output selected
+    if [[ "$OUTPUT_MODE" == "gdrive" ]]; then
+        echo -e "\n  ${CYAN}Testing Google Drive credentials...${NC}"
+        if [[ -z "$GDRIVE_PASS" ]]; then
+            read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
+        fi
+        local test_json
+        test_json=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
+        if [[ $? -ne 0 || -z "$test_json" ]]; then
+            log_error "Wrong Google Drive password"
+            GDRIVE_PASS=""
+            return 1
+        fi
+        echo "$GDRIVE_PASS" > "$GDRIVE_PASS_FILE" && chmod 600 "$GDRIVE_PASS_FILE"
+        echo -e "  ${GREEN}✓${NC} Google Drive credentials OK"
+    fi
+
     echo -e "\n${GREEN}${BOLD}>>> LAUNCHING -- no more prompts, sit back <<<${NC}\n"
     export OUTPUT_MODE DC_NAME ALTITUDE
     if ! check_kubectl; then return 1; fi
