@@ -1077,7 +1077,7 @@ DKRFILE
     cat > "${DOCKERFILE_DIR}/entrypoint.sh" << 'ENTRYPT'
 #!/bin/bash
 set -euo pipefail
-export NON_INTERACTIVE=true AUTO_STOP_SERVICES=false AUTO_KILL_GPU_PROCESSES=true
+export NON_INTERACTIVE=true AUTO_STOP_SERVICES=false AUTO_KILL_GPU_PROCESSES=false
 SCRIPT_PATH="/opt/thermal-diagnostics/thermal-diagnostics.sh"
 RESULTS_BASE="/root/TDAS"
 for tool in racadm ipmitool; do
