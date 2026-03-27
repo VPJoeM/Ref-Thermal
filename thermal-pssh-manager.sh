@@ -387,6 +387,7 @@ WRAPPER_EOF
         $PSSH_CMD -h "$dfile2" -l "$SSH_USER" -x "-i $SSH_KEY $SSH_OPTS_STR" \
             -t 3600 -o "$outdir" -e "$outdir" \
             "chmod +x /tmp/thermal_wrapper.sh && bash /tmp/thermal_wrapper.sh" >/dev/null 2>&1 &
+        sleep 2  # let pssh read the hosts file before cleanup
         rm -f "$dfile2" 2>/dev/null
     fi
 
