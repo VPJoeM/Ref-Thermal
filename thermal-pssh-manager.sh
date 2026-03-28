@@ -394,26 +394,27 @@ export AUTO_STOP_SERVICES=true
 export AUTO_KILL_GPU_PROCESSES=true
 
 NFS_STAGE="__NFS_STAGE__"
+RUN_TOKEN="__RUN_TOKEN__"
 STATUS_FILE="/tmp/.thermal-status"
-trap 'echo "done" > $STATUS_FILE' EXIT
+trap 'echo "${RUN_TOKEN}:done" > $STATUS_FILE' EXIT
 
-echo "starting" > $STATUS_FILE
+echo "${RUN_TOKEN}:starting" > $STATUS_FILE
 sudo -E bash /tmp/thermal_diag.sh --local 2>&1 | while IFS= read -r line; do
     echo "$line"
     case "$line" in
-        *"fan speed"*|*"Fan"*|*"package"*|*"install"*) echo "setup" > $STATUS_FILE ;;
-        *"GPU "*Temperature*|*"°C"*) echo "gpu-stress" > $STATUS_FILE ;;
-        *"TSR collection progress"*) pct=$(echo "$line" | grep -o '[0-9]*$'); echo "tsr:${pct}" > $STATUS_FILE ;;
-        *"Cooldown"*) echo "cooldown" > $STATUS_FILE ;;
-        *"Processing"*|*"merging"*) echo "processing" > $STATUS_FILE ;;
-        *"results are saved"*|*"Results zip"*|*"Script finalizing"*) echo "complete" > $STATUS_FILE ;;
-        *"Script failed"*|*"ERROR"*) echo "failed" > $STATUS_FILE ;;
+        *"fan speed"*|*"Fan"*|*"package"*|*"install"*) echo "${RUN_TOKEN}:setup" > $STATUS_FILE ;;
+        *"GPU "*Temperature*|*"°C"*) echo "${RUN_TOKEN}:gpu-stress" > $STATUS_FILE ;;
+        *"TSR collection progress"*) pct=$(echo "$line" | grep -o '[0-9]*$'); echo "${RUN_TOKEN}:tsr:${pct}" > $STATUS_FILE ;;
+        *"Cooldown"*) echo "${RUN_TOKEN}:cooldown" > $STATUS_FILE ;;
+        *"Processing"*|*"merging"*) echo "${RUN_TOKEN}:processing" > $STATUS_FILE ;;
+        *"results are saved"*|*"Results zip"*|*"Script finalizing"*) echo "${RUN_TOKEN}:complete" > $STATUS_FILE ;;
+        *"Script failed"*|*"ERROR"*) echo "${RUN_TOKEN}:failed" > $STATUS_FILE ;;
     esac
 done
 
 # if NFS staging dir exists, copy results there for fast collection
 if [ -d "$NFS_STAGE" ]; then
-    echo "staging" > $STATUS_FILE
+    echo "${RUN_TOKEN}:staging" > $STATUS_FILE
     rzip=$(sudo bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1')
     if [ -n "$rzip" ]; then
         hn=$(hostname -s)
@@ -423,8 +424,11 @@ if [ -d "$NFS_STAGE" ]; then
     fi
 fi
 WRAPPER_EOF
+    # generate unique run token
+    local RUN_TOKEN; RUN_TOKEN="r$(date +%s)"
+
     # inject runtime values
-    sed -i.bak "s/__ALTITUDE__/$ALTITUDE/;s|__NFS_STAGE__|${NFS_RUN_DIR:-}|" "$wrapper" && rm -f "${wrapper}.bak"
+    sed -i.bak "s/__ALTITUDE__/$ALTITUDE/;s|__NFS_STAGE__|${NFS_RUN_DIR:-}|;s|__RUN_TOKEN__|${RUN_TOKEN}|" "$wrapper" && rm -f "${wrapper}.bak"
 
     log_info "Uploading run wrapper..."
     if [[ ${#direct_hosts[@]} -gt 0 ]]; then
@@ -469,9 +473,6 @@ WRAPPER_EOF
 
     echo -e "  ${DIM}────────────────────────────────────────────────────${NC}"
 
-    # first poll after 60s to let nodes actually start
-    sleep 60
-
     # wait for any background job (pssh or individual proxy ssh)
     while jobs -r 2>/dev/null | grep -q .; do
         local elapsed=$(( $(date +%s) - start_time ))
@@ -487,9 +488,13 @@ WRAPPER_EOF
                 fail_count=$((fail_count + 1)); continue
             fi
 
-            # poll the status file -- SSH timeouts are not failures
+            # poll the status file -- only trust entries with our run token
+            local raw_st=""
+            raw_st=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null 2>/dev/null | tr -d '\r')
             local st=""
-            st=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null 2>/dev/null | tr -d '\r')
+            if [[ "$raw_st" == "${RUN_TOKEN}:"* ]]; then
+                st="${raw_st#${RUN_TOKEN}:}"
+            fi
 
             case "$st" in
                 complete|done)
@@ -536,9 +541,13 @@ WRAPPER_EOF
     for ip in "${NODE_IPS[@]}"; do
         local stdout_file="$outdir/$ip"
 
-        # always re-poll the status file for final determination
-        local node_st
-        node_st=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null 2>/dev/null | tr -d '\r')
+        # always re-poll the status file -- only trust our run token
+        local raw_final=""
+        raw_final=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null 2>/dev/null | tr -d '\r')
+        local node_st=""
+        if [[ "$raw_final" == "${RUN_TOKEN}:"* ]]; then
+            node_st="${raw_final#${RUN_TOKEN}:}"
+        fi
 
         # also check if a result zip exists (most reliable indicator)
         if [[ "$node_st" != "complete" && "$node_st" != "done" ]]; then
