@@ -313,6 +313,25 @@ deploy_and_run() {
     esac
     echo ""
 
+    # check for already-running thermal tests
+    for ip in "${NODE_IPS[@]}"; do
+        local running
+        running=$(ssh_cmd "$ip" "pgrep -f 'thermal_diag\|dcgmproftester' 2>/dev/null | head -1" </dev/null | tr -d '\r')
+        if [[ -n "$running" ]]; then
+            log_warn "${ip} has a thermal test already running (PID $running)"
+            echo -ne "  Kill it and continue? (y/N): "
+            read -r -n 1 ans </dev/tty; echo "" >/dev/tty
+            if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+                ssh_cmd "$ip" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag; sudo pkill -9 -f thermal_wrapper" </dev/null 2>/dev/null
+                sleep 2
+                log_info "Killed old processes on $ip"
+            else
+                log_error "Aborting -- clear running tests first"
+                return 1
+            fi
+        fi
+    done
+
     # split nodes into direct and proxy groups
     local direct_hosts=() proxy_hosts=()
     for ip in "${NODE_IPS[@]}"; do
@@ -694,7 +713,7 @@ collect_to_node_then_gdrive() {
     local drive_folder="${GDRIVE_FOLDER}/${rname}"
 
     # pick upload node -- any node with rclone or internet access
-    local sa_tmp; sa_tmp=$(mktemp /tmp/.gdrive-sa-XXXX.json)
+    local sa_tmp="/tmp/.gdrive-sa-$$.json"
     decrypt_gdrive_sa "$sa_tmp" || return 1
 
     local had_rclone="yes"
@@ -1313,7 +1332,7 @@ if [[ -z "$GDRIVE_PASS" ]]; then
     echo -e "${CYAN}Google Drive credentials required for result uploads.${NC}"
     read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
     # verify it decrypts
-    _test_sa=$(mktemp /tmp/.gdrive-test-XXXX.json)
+    _test_sa="/tmp/.gdrive-test-$$.json"
     echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" > "$_test_sa" 2>/dev/null
     if [[ $? -ne 0 || ! -s "$_test_sa" ]]; then
         rm -f "$_test_sa"

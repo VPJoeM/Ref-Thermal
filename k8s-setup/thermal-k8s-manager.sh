@@ -1185,7 +1185,7 @@ if [[ -z "$GDRIVE_PASS" ]]; then
     echo ""
     echo -e "${CYAN}Google Drive credentials required for result uploads.${NC}"
     read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
-    _test_sa=$(mktemp /tmp/.gdrive-test-XXXX.json)
+    _test_sa="/tmp/.gdrive-test-$$.json"
     echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" > "$_test_sa" 2>/dev/null
     if [[ $? -ne 0 || ! -s "$_test_sa" ]]; then
         rm -f "$_test_sa"
