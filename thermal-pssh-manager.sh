@@ -831,6 +831,21 @@ collect_to_node_then_gdrive() {
     ssh_cmd "$relay" "sudo rm -f /tmp/.gdrive-sa.json" 2>/dev/null
     [[ "$had_rclone" == "no" ]] && ssh_cmd "$relay" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
 
+    # create consolidated rollup zip on NFS if available
+    local nfs_rollup=""
+    if [[ -n "${NFS_RUN_DIR:-}" ]]; then
+        local nfs_count
+        nfs_count=$(ssh_cmd "$relay" "ls '${NFS_RUN_DIR}'/*.zip 2>/dev/null | wc -l" | tr -d '\r ')
+        if [[ "${nfs_count:-0}" -gt 0 ]]; then
+            log_info "Creating rollup zip on NFS (${nfs_count} nodes)..."
+            nfs_rollup="${NFS_RUN_DIR}.zip"
+            ssh_cmd "$relay" "cd '${NFS_STAGING_DIR}' && sudo zip -r '${nfs_rollup}' '$(basename "${NFS_RUN_DIR}")/' >/dev/null 2>&1" </dev/null
+            local rollup_sz
+            rollup_sz=$(ssh_cmd "$relay" "ls -lh '${nfs_rollup}' 2>/dev/null" | awk '{print $5}' | tr -d '\r')
+            [[ -n "$rollup_sz" ]] && log_success "Rollup: ${nfs_rollup} (${rollup_sz})"
+        fi
+    fi
+
     # cleanup local node results (not NFS - never touch /data/)
     for ip in "${NODE_IPS[@]}"; do
         ssh_cmd "$ip" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/* /tmp/.thermal-status" </dev/null 2>/dev/null &
@@ -844,6 +859,7 @@ collect_to_node_then_gdrive() {
         echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
         echo -e "  ${CYAN}Drive:${NC}    ${drive_folder}/"
         echo -e "  ${CYAN}Uploaded:${NC} ${uploaded} nodes"
+        [[ -n "$nfs_rollup" ]] && echo -e "  ${CYAN}Rollup:${NC}  ${nfs_rollup}"
         [[ -n "${NFS_RUN_DIR:-}" ]] && echo -e "  ${CYAN}NFS:${NC}     ${NFS_RUN_DIR}/"
         [[ -n "$failed_nodes" ]] && echo -e "  ${RED}Failed:${NC} ${failed_nodes}"
     else

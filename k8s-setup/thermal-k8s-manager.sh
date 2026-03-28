@@ -514,6 +514,21 @@ collect_and_upload_gdrive_from_node() {
     remote_ssh "$relay_ip" "sudo rm -f /tmp/.gdrive-sa.json" 2>/dev/null
     [[ "$had_rclone" == "no" ]] && remote_ssh "$relay_ip" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
 
+    # create consolidated rollup zip on NFS if available
+    local nfs_rollup=""
+    if [[ "$use_nfs" == true ]]; then
+        local nfs_count
+        nfs_count=$(remote_ssh "$relay_ip" "ls '${nfs_dir}'/*.zip 2>/dev/null | wc -l" | tr -d '\r ')
+        if [[ "${nfs_count:-0}" -gt 0 ]]; then
+            log_info "Creating rollup zip on NFS (${nfs_count} nodes)..."
+            nfs_rollup="${nfs_dir}.zip"
+            remote_ssh "$relay_ip" "cd '${NFS_STAGING_DIR}' && sudo zip -r '${nfs_rollup}' '$(basename "${nfs_dir}")/' >/dev/null 2>&1" </dev/null
+            local rollup_sz
+            rollup_sz=$(remote_ssh "$relay_ip" "ls -lh '${nfs_rollup}' 2>/dev/null" | awk '{print $5}' | tr -d '\r')
+            [[ -n "$rollup_sz" ]] && log_success "Rollup: ${nfs_rollup} (${rollup_sz})"
+        fi
+    fi
+
     # cleanup local node results only
     for nn in "${NODE_IPS[@]}"; do
         local pip="${NODE_PUBLIC_IPS[$nn]:-}"
@@ -528,6 +543,7 @@ collect_and_upload_gdrive_from_node() {
         echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
         echo -e "  ${CYAN}Drive:${NC}    ${drive_folder}/"
         echo -e "  ${CYAN}Uploaded:${NC} ${uploaded} nodes"
+        [[ -n "$nfs_rollup" ]] && echo -e "  ${CYAN}Rollup:${NC}  ${nfs_rollup}"
         [[ "$use_nfs" == true ]] && echo -e "  ${CYAN}NFS:${NC}     ${nfs_dir}/"
     else
         echo -e "${RED}${BOLD}  ALL UPLOADS FAILED${NC}"
