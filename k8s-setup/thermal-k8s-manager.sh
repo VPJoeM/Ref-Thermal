@@ -486,7 +486,7 @@ collect_and_upload_gdrive_from_node() {
         remote_ssh "$collect_ip" "sudo rm -rf /root/Reports/thermal-results/${rname}*" 2>/dev/null
         for nn in "${NODE_IPS[@]}"; do
             local pip="${NODE_PUBLIC_IPS[$nn]:-}"
-            [[ -n "$pip" ]] && remote_ssh "$pip" "sudo rm -f /root/TDAS/dcgmprof-*.zip" </dev/null 2>/dev/null &
+            [[ -n "$pip" ]] && remote_ssh "$pip" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/*" </dev/null 2>/dev/null &
         done
         wait
         echo -e "${GREEN}${BOLD}  UPLOADED TO GOOGLE DRIVE${NC}"

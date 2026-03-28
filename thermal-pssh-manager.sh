@@ -593,10 +593,10 @@ collect_to_node() {
     # cleanup the temp key
     ssh_cmd "$COLLECT_NODE" "sudo rm -rf /root/.thermal-key"
 
-    # cleanup per-node raw results to free disk
+    # cleanup per-node raw results and old rollups to free disk
     log_info "Cleaning up raw results on worker nodes..."
     for ip in "${NODE_IPS[@]}"; do
-        ssh_cmd "$ip" "sudo rm -f /root/TDAS/dcgmprof-*.zip /tmp/.thermal-status" </dev/null 2>/dev/null &
+        ssh_cmd "$ip" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/* /tmp/.thermal-status" </dev/null 2>/dev/null &
     done
     wait
 
@@ -733,9 +733,9 @@ collect_to_local_then_upload() {
         log_success "Local copy: ${REPORTS_DIR}/${rname}.zip"
     fi
 
-    # cleanup per-node raw results
+    # cleanup per-node raw results and old rollups
     for ip in "${NODE_IPS[@]}"; do
-        ssh_cmd "$ip" "sudo rm -f /root/TDAS/dcgmprof-*.zip /tmp/.thermal-status" </dev/null 2>/dev/null &
+        ssh_cmd "$ip" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/* /tmp/.thermal-status" </dev/null 2>/dev/null &
     done
     wait
 }
