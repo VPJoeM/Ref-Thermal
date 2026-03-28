@@ -369,15 +369,19 @@ deploy_and_run() {
         fi
     done
 
-    # set up NFS staging if available (check via first node)
-    NFS_RUN_DIR=""
-    local rts_run; rts_run=$(date +%Y%m%d-%H%M%S)
-    local nfs_rname="${DC_NAME}-${rts_run}"
-    if ssh_cmd "${NODE_IPS[0]}" "test -d '${NFS_STAGING_DIR}' && sudo mkdir -p '${NFS_STAGING_DIR}/${nfs_rname}'" </dev/null 2>/dev/null; then
-        NFS_RUN_DIR="${NFS_STAGING_DIR}/${nfs_rname}"
-        log_info "NFS staging: ${NFS_RUN_DIR}"
+    # set up NFS staging -- reuse existing dir on retry, create new one otherwise
+    if [[ -n "${NFS_RUN_DIR:-}" ]] && ssh_cmd "${NODE_IPS[0]}" "test -d '${NFS_RUN_DIR}'" </dev/null 2>/dev/null; then
+        log_info "NFS staging (retry): ${NFS_RUN_DIR}"
     else
-        log_info "NFS not available, will use SSH-based collection"
+        NFS_RUN_DIR=""
+        local rts_run; rts_run=$(date +%Y%m%d-%H%M%S)
+        local nfs_rname="${DC_NAME}-${rts_run}"
+        if ssh_cmd "${NODE_IPS[0]}" "test -d '${NFS_STAGING_DIR}' && sudo mkdir -p '${NFS_STAGING_DIR}/${nfs_rname}'" </dev/null 2>/dev/null; then
+            NFS_RUN_DIR="${NFS_STAGING_DIR}/${nfs_rname}"
+            log_info "NFS staging: ${NFS_RUN_DIR}"
+        else
+            log_info "NFS not available, will use SSH-based collection"
+        fi
     fi
 
     # create wrapper script that runs non-interactively and writes status updates
@@ -599,8 +603,13 @@ FAILEOF
 
 collect_results() {
     local outdir="$1"
-    local rts; rts=$(date +%Y%m%d-%H%M%S)
-    local rname="${DC_NAME}-${rts}"
+    local rname
+    if [[ -n "${NFS_RUN_DIR:-}" ]]; then
+        rname=$(basename "${NFS_RUN_DIR}")
+    else
+        local rts; rts=$(date +%Y%m%d-%H%M%S)
+        rname="${DC_NAME}-${rts}"
+    fi
     local remote_rollup="/root/Reports/thermal-results/${rname}"
 
     # cleanup wrapper scripts on all nodes
