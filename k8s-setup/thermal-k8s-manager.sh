@@ -22,6 +22,8 @@ DEFAULT_SSH_USER="${SSH_USER:-ubuntu}"
 DEFAULT_SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 DEFAULT_GPU_COUNT=8
 JUMP_HOST=""
+HISTORY_FILE="/tmp/.thermal-k8s-history.cache"
+FAILED_NODES_FILE="/tmp/.thermal-k8s-failed-nodes"
 
 EXECUTION_MODE=""
 CONTROL_PLANE_IP=""
@@ -65,6 +67,30 @@ log_info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
+
+save_history() {
+    cat > "$HISTORY_FILE" << EOF
+HIST_NODE_IPS="${NODE_IPS[*]}"
+HIST_OUTPUT_MODE="$OUTPUT_MODE"
+HIST_EXECUTION_MODE="$EXECUTION_MODE"
+HIST_CONTROL_PLANE_IP="${CONTROL_PLANE_IP:-}"
+HIST_SSH_USER="$DEFAULT_SSH_USER"
+HIST_SSH_KEY="$DEFAULT_SSH_KEY"
+HIST_TIMESTAMP="$(date '+%Y-%m-%d %H:%M')"
+EOF
+}
+
+load_history() {
+    [[ ! -f "$HISTORY_FILE" ]] && return 1
+    source "$HISTORY_FILE" 2>/dev/null
+    NODE_IPS=($HIST_NODE_IPS)
+    OUTPUT_MODE="$HIST_OUTPUT_MODE"
+    EXECUTION_MODE="$HIST_EXECUTION_MODE"
+    CONTROL_PLANE_IP="${HIST_CONTROL_PLANE_IP:-}"
+    DEFAULT_SSH_USER="$HIST_SSH_USER"
+    DEFAULT_SSH_KEY="$HIST_SSH_KEY"
+    return 0
+}
 
 # ─── SSH with proxy auto-detect ───────────────────────────────
 
@@ -336,6 +362,26 @@ launch_jobs() {
         export COLLECT_NODE="$ch"
     fi
 
+    # pre-flight: check for already-running thermal tests on nodes
+    for nn in "${node_ips[@]}"; do
+        local pip="${NODE_PUBLIC_IPS[$nn]:-$CONTROL_PLANE_IP}"
+        local running
+        running=$(remote_ssh "$pip" "pgrep -f 'thermal_diag\|dcgmproftester' 2>/dev/null | head -1" </dev/null 2>/dev/null | tr -d '\r')
+        if [[ -n "$running" ]]; then
+            log_warn "${nn} has a thermal test already running (PID $running)"
+            echo -ne "  Kill it and continue? (y/N): "
+            read -r -n 1 ans </dev/tty; echo "" >/dev/tty
+            if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+                remote_ssh "$pip" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null
+                sleep 2
+                log_info "Killed old processes on $nn"
+            else
+                log_error "Aborting -- clear running tests first"
+                return 1
+            fi
+        fi
+    done
+
     local job_names=() job_nodes=()
     for nn in "${node_ips[@]}"; do
         local gc; gc=$(get_node_gpu_count "$nn")
@@ -380,6 +426,33 @@ monitor_jobs() {
             echo ""; echo ""
             [[ $failed -gt 0 ]] && log_warn "$failed job(s) failed"
             log_success "All jobs finished. $completed succeeded, $failed failed."
+
+            # save failed nodes for retry
+            if [[ $failed -gt 0 ]]; then
+                local failed_names=()
+                for jn in "${job_names[@]}"; do
+                    local jj; jj=$(kubectl_exec get job "$jn" -n thermal-diagnostics -o json 2>/dev/null)
+                    local f_cnt; f_cnt=$(echo "$jj" | grep -o '"failed": *[0-9]*' | head -1 | grep -o '[0-9]*$')
+                    if [[ "${f_cnt:-0}" -gt 0 ]]; then
+                        local nn; nn=$(echo "$jj" | grep -o '"nodeName": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
+                        [[ -n "$nn" ]] && failed_names+=("$nn")
+                    fi
+                done
+                if [[ ${#failed_names[@]} -gt 0 ]]; then
+                    cat > "$FAILED_NODES_FILE" << FAILEOF
+FAILED_IPS="${failed_names[*]}"
+FAIL_NFS_RUN_DIR="${NFS_RUN_DIR:-}"
+FAIL_EXECUTION_MODE="${EXECUTION_MODE}"
+FAIL_CONTROL_PLANE_IP="${CONTROL_PLANE_IP:-}"
+FAIL_SSH_USER="${DEFAULT_SSH_USER}"
+FAIL_SSH_KEY="${DEFAULT_SSH_KEY}"
+FAIL_OUTPUT_MODE="${OUTPUT_MODE}"
+FAILEOF
+                fi
+            else
+                rm -f "$FAILED_NODES_FILE"
+            fi
+
             echo ""; collect_and_rollup "$run_id"
             break
         fi
@@ -906,6 +979,7 @@ run_diagnostics_menu() {
 
     echo -e "\n${GREEN}${BOLD}>>> LAUNCHING -- no more prompts, sit back <<<${NC}\n"
     export OUTPUT_MODE DC_NAME ALTITUDE
+    save_history
     if ! check_kubectl; then return 1; fi
     kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
 
@@ -1036,18 +1110,127 @@ show_menu() {
     echo -e "${BLUE}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
     echo -e "\n  ${GREEN}${BOLD}1)${NC} Run Thermal Diagnostics  ${DIM}← start here${NC}"
     echo -e "     ${DIM}Quick wizard → auto runs across entire fleet${NC}"
-    echo -e "\n  ${GREEN}2)${NC} View Status / Results"
-    echo -e "  ${GREEN}3)${NC} Cleanup Jobs"
+
+    if [[ -f "$HISTORY_FILE" ]]; then
+        source "$HISTORY_FILE" 2>/dev/null
+        local nc; nc=$(echo "$HIST_NODE_IPS" | wc -w | tr -d ' ')
+        echo -e "\n  ${GREEN}${BOLD}2)${NC} Rerun Last  ${DIM}(${nc} nodes, ${HIST_TIMESTAMP:-unknown})${NC}"
+    fi
+
+    if [[ -f "$FAILED_NODES_FILE" ]]; then
+        source "$FAILED_NODES_FILE" 2>/dev/null
+        local fc; fc=$(echo "$FAILED_IPS" | wc -w | tr -d ' ')
+        echo -e "  ${RED}${BOLD}3)${NC} Retry Failed  ${DIM}(${fc} node(s) from last run)${NC}"
+    fi
+
+    echo -e "\n  ${GREEN}4)${NC} View Status / Results"
+    echo -e "  ${GREEN}5)${NC} Cleanup Jobs"
     echo -e "${DIM}──────────────────────────────────────────────────────────${NC}"
     echo -e "  ${YELLOW}a)${NC} Shell alias  ${YELLOW}h)${NC} Help  ${RED}0)${NC} Exit"
     echo -e "${DIM}──────────────────────────────────────────────────────────${NC}\n"
+}
+
+rerun_last() {
+    if ! load_history; then
+        log_error "No previous run found"
+        return 1
+    fi
+    echo ""
+    echo -e "${CYAN}${BOLD}Rerunning last configuration:${NC}"
+    echo -e "  ${CYAN}Nodes:${NC}     ${#NODE_IPS[@]} (${NODE_IPS[*]})"
+    echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
+    echo -e "  ${CYAN}Mode:${NC}      ${EXECUTION_MODE}"
+    echo -e "  ${CYAN}Last run:${NC}  ${HIST_TIMESTAMP}"
+    echo ""
+    read -p "  Go? (Y/n): " rc
+    [[ "$rc" =~ ^[Nn]$ ]] && return 0
+    echo -e "\n${GREEN}${BOLD}>>> LAUNCHING -- no more prompts, sit back <<<${NC}\n"
+    DC_NAME="sea1"; ALTITUDE=220
+    if ! check_kubectl; then return 1; fi
+
+    # repopulate arrays for local mode
+    if [[ "$EXECUTION_MODE" == "local" ]]; then
+        local ni; ni=$(kubectl_exec get nodes -o wide --no-headers 2>/dev/null)
+        while read -r name status roles age ver iip rest; do
+            for n in "${NODE_IPS[@]}"; do
+                if [[ "$name" == "$n" ]]; then
+                    IP_MAP_INTERNAL["$n"]="$iip"
+                    NODE_PUBLIC_IPS["$n"]="$iip"
+                    NODE_CONNECT["$iip"]="direct"
+                    IP_MAP_HOSTNAME["$iip"]="$n"
+                fi
+            done
+        done <<< "$ni"
+        CONTROL_PLANE_IP="127.0.0.1"
+    fi
+
+    kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
+    launch_jobs "${NODE_IPS[@]}"
+}
+
+retry_failed() {
+    if [[ ! -f "$FAILED_NODES_FILE" ]]; then
+        log_error "No failed nodes from a previous run"
+        return 1
+    fi
+    source "$FAILED_NODES_FILE" 2>/dev/null
+    local retry_ips=($FAILED_IPS)
+    if [[ ${#retry_ips[@]} -eq 0 ]]; then
+        log_info "No failed nodes to retry"
+        rm -f "$FAILED_NODES_FILE"
+        return 0
+    fi
+
+    echo ""
+    echo -e "${CYAN}${BOLD}Retrying ${#retry_ips[@]} failed node(s):${NC}"
+    for ip in "${retry_ips[@]}"; do
+        echo -e "  ${YELLOW}•${NC} $ip"
+    done
+    echo ""
+    read -p "  Go? (Y/n): " rc
+    [[ "$rc" =~ ^[Nn]$ ]] && return 0
+
+    # restore settings
+    EXECUTION_MODE="${FAIL_EXECUTION_MODE:-local}"
+    CONTROL_PLANE_IP="${FAIL_CONTROL_PLANE_IP:-127.0.0.1}"
+    DEFAULT_SSH_USER="${FAIL_SSH_USER:-ubuntu}"
+    DEFAULT_SSH_KEY="${FAIL_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+    OUTPUT_MODE="${FAIL_OUTPUT_MODE:-gdrive}"
+    DC_NAME="sea1"; ALTITUDE=220
+    NODE_IPS=("${retry_ips[@]}")
+    NFS_RUN_DIR="${FAIL_NFS_RUN_DIR:-}"
+
+    if ! check_kubectl; then return 1; fi
+
+    # repopulate arrays
+    if [[ "$EXECUTION_MODE" == "local" ]]; then
+        local ni; ni=$(kubectl_exec get nodes -o wide --no-headers 2>/dev/null)
+        while read -r name status roles age ver iip rest; do
+            for n in "${NODE_IPS[@]}"; do
+                if [[ "$name" == "$n" ]]; then
+                    IP_MAP_INTERNAL["$n"]="$iip"
+                    NODE_PUBLIC_IPS["$n"]="$iip"
+                    NODE_CONNECT["$iip"]="direct"
+                    IP_MAP_HOSTNAME["$iip"]="$n"
+                fi
+            done
+        done <<< "$ni"
+        CONTROL_PLANE_IP="127.0.0.1"
+    fi
+
+    echo -e "\n${GREEN}${BOLD}>>> RETRYING FAILED NODES <<<${NC}\n"
+    kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
+    launch_jobs "${NODE_IPS[@]}"
 }
 
 run_menu() {
     while true; do
         show_menu; read -p "  Select: " ch
         case "$ch" in
-            1) run_diagnostics_menu ;; 2) view_status ;; 3) cleanup_jobs ;;
+            1) run_diagnostics_menu ;;
+            2) rerun_last ;;
+            3) retry_failed ;;
+            4) view_status ;; 5) cleanup_jobs ;;
             a|A) create_script_alias ;; h|H) show_help ;; 0|q|Q) exit 0 ;;
             *) echo -e "  ${RED}Invalid${NC}" ;;
         esac
@@ -1216,6 +1399,30 @@ ENTRYPT
     # copy thermal script into build context
     cp "$THERMAL_SCRIPT" "${DOCKERFILE_DIR}/thermal-diagnostics-2.6.2-vp.sh"
 }
+
+# ─── Entry Point ──────────────────────────────────────────────
+
+# auto-launch inside screen so the run survives disconnects
+if [[ -z "${STY:-}" && -z "${THERMAL_IN_SCREEN:-}" ]]; then
+    if ! command -v screen &>/dev/null; then
+        echo "Installing screen..."
+        if command -v brew &>/dev/null; then
+            brew install screen >/dev/null 2>&1
+        elif command -v apt-get &>/dev/null; then
+            sudo apt-get install -y screen >/dev/null 2>&1
+        fi
+    fi
+    if command -v screen &>/dev/null; then
+        SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+        echo ""
+        echo -e "\033[0;36mStarting in screen session 'thermal-k8s'...\033[0m"
+        echo -e "\033[2m  • Detach anytime:  Ctrl+A then D"
+        echo -e "  • Reattach:        screen -r thermal-k8s\033[0m"
+        echo ""
+        sleep 2
+        exec screen -S thermal-k8s bash -c "THERMAL_IN_SCREEN=1 bash '$SCRIPT_PATH' $*; echo ''; echo 'Press Enter to exit screen...'; read"
+    fi
+fi
 
 # run extraction
 extract_embedded_files
