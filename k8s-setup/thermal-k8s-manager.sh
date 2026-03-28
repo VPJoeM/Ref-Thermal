@@ -444,31 +444,39 @@ collect_and_upload_gdrive_from_node() {
     fi
 
     local uploaded=0
+    local nfs_rollup=""
+    local nfs_node_count=0
 
     if [[ "$use_nfs" == true ]]; then
-        log_info "Uploading from NFS → Google Drive: ${drive_folder}/"
-        while IFS= read -r zipfile <&3; do
-            [[ -z "$zipfile" ]] && continue
-            local nzn; nzn=$(basename "$zipfile")
-            local zs; zs=$(remote_ssh "$relay_ip" "ls -lh '${zipfile}'" | awk '{print $5}' | tr -d '\r')
-            echo -ne "  ${YELLOW}→${NC} ${nzn} (${zs})..."
+        # NFS path: create rollup, upload single zip
+        nfs_node_count=$(remote_ssh "$relay_ip" "ls '${nfs_dir}'/*.zip 2>/dev/null | wc -l" | tr -d '\r ')
+        log_info "NFS has ${nfs_node_count} result(s), creating rollup..."
+        echo -e "${DIM}Contents:${NC}"
+        remote_ssh "$relay_ip" "ls -lh '${nfs_dir}'/*.zip 2>/dev/null" | while IFS= read -r line; do
+            local nzn; nzn=$(echo "$line" | awk '{print $NF}')
+            local zs; zs=$(echo "$line" | awk '{print $5}')
+            echo -e "  ${GREEN}✓${NC} $(basename "$nzn") (${zs})"
+        done
 
+        nfs_rollup="${nfs_dir}.zip"
+        local rname_base; rname_base=$(basename "${nfs_dir}")
+        remote_ssh "$relay_ip" "cd '${NFS_STAGING_DIR}' && sudo zip -r '${nfs_rollup}' '${rname_base}/' >/dev/null 2>&1" </dev/null
+
+        local rollup_sz
+        rollup_sz=$(remote_ssh "$relay_ip" "ls -lh '${nfs_rollup}' 2>/dev/null" | awk '{print $5}' | tr -d '\r')
+
+        if [[ -n "$rollup_sz" ]]; then
+            log_info "Uploading rollup to Google Drive (${rollup_sz})..."
             remote_ssh "$relay_ip" \
-                "sudo rclone copyto '${zipfile}' ':drive:${drive_folder}/${nzn}' \
+                "sudo rclone copyto '${nfs_rollup}' ':drive:${GDRIVE_FOLDER}/${rname}.zip' \
                  --drive-service-account-file /tmp/.gdrive-sa.json \
                  --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
                  --drive-scope drive 2>&1" >/dev/null 2>&1
-
-            if [[ $? -eq 0 ]]; then
-                echo -e " ${GREEN}✓${NC}"
-                uploaded=$((uploaded + 1))
-            else
-                echo -e " ${RED}failed${NC}"
-            fi
-        done 3< <(remote_ssh "$relay_ip" "ls '${nfs_dir}'/*.zip 2>/dev/null" | tr -d '\r')
+            [[ $? -eq 0 ]] && uploaded=1
+        fi
     else
-        # SSH relay fallback (same as before)
-        log_info "Uploading via SSH relay → Google Drive: ${drive_folder}/"
+        # SSH relay fallback: collect to relay, build rollup, upload
+        log_info "Collecting results via SSH relay..."
         while read -r nn <&3; do
             [[ -z "$nn" ]] && continue
             local pub_ip="${NODE_PUBLIC_IPS[$nn]:-$CONTROL_PLANE_IP}"
@@ -489,45 +497,41 @@ collect_and_upload_gdrive_from_node() {
             nzn="${nn}-${st}.zip"
 
             remote_ssh "$pub_ip" "sudo cp '$rzip' /tmp/thermal-relay.zip && sudo chmod 644 /tmp/thermal-relay.zip" 2>/dev/null
-            remote_scp_from "$pub_ip" "/tmp/thermal-relay.zip" "/tmp/${nzn}"
-
-            local ul_out
-            ul_out=$(remote_ssh "$relay_ip" \
-                "sudo rclone copyto '/tmp/${nzn}' ':drive:${drive_folder}/${nzn}' \
-                 --drive-service-account-file /tmp/.gdrive-sa.json \
-                 --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
-                 --drive-scope drive 2>&1" 2>/dev/null)
-
-            rm -f "/tmp/${nzn}"
+            remote_scp_from "$pub_ip" "/tmp/thermal-relay.zip" "/tmp/.thermal-rollup-$$/${nzn}"
             remote_ssh "$pub_ip" "rm -f /tmp/thermal-relay.zip" 2>/dev/null
 
-            if [[ $? -eq 0 ]]; then
-                echo -e " ${GREEN}✓${NC}"
-                uploaded=$((uploaded + 1))
+            if [[ -f "/tmp/.thermal-rollup-$$/${nzn}" ]]; then
+                local zs; zs=$(du -h "/tmp/.thermal-rollup-$$/${nzn}" | cut -f1)
+                echo -e " ${GREEN}✓${NC} (${zs})"
+                nfs_node_count=$((nfs_node_count + 1))
             else
                 echo -e " ${RED}failed${NC}"
             fi
         done 3<<< "$jnodes"
+
+        if [[ $nfs_node_count -gt 0 ]]; then
+            mkdir -p "/tmp/.thermal-rollup-$$"
+            log_info "Creating rollup (${nfs_node_count} nodes)..."
+            (cd /tmp/.thermal-rollup-$$ && zip -r "/tmp/${rname}.zip" *.zip >/dev/null 2>&1)
+            local rollup_sz; rollup_sz=$(du -h "/tmp/${rname}.zip" | cut -f1)
+
+            log_info "Uploading rollup to Google Drive (${rollup_sz})..."
+            remote_scp_to "$relay_ip" "/tmp/${rname}.zip" "/tmp/${rname}.zip"
+            remote_ssh "$relay_ip" \
+                "sudo rclone copyto '/tmp/${rname}.zip' ':drive:${GDRIVE_FOLDER}/${rname}.zip' \
+                 --drive-service-account-file /tmp/.gdrive-sa.json \
+                 --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
+                 --drive-scope drive 2>&1" >/dev/null 2>&1
+            [[ $? -eq 0 ]] && uploaded=1
+
+            remote_ssh "$relay_ip" "rm -f '/tmp/${rname}.zip'" 2>/dev/null
+            rm -rf "/tmp/.thermal-rollup-$$" "/tmp/${rname}.zip"
+        fi
     fi
 
     # cleanup rclone + SA key (never touch NFS)
     remote_ssh "$relay_ip" "sudo rm -f /tmp/.gdrive-sa.json" 2>/dev/null
     [[ "$had_rclone" == "no" ]] && remote_ssh "$relay_ip" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
-
-    # create consolidated rollup zip on NFS if available
-    local nfs_rollup=""
-    if [[ "$use_nfs" == true ]]; then
-        local nfs_count
-        nfs_count=$(remote_ssh "$relay_ip" "ls '${nfs_dir}'/*.zip 2>/dev/null | wc -l" | tr -d '\r ')
-        if [[ "${nfs_count:-0}" -gt 0 ]]; then
-            log_info "Creating rollup zip on NFS (${nfs_count} nodes)..."
-            nfs_rollup="${nfs_dir}.zip"
-            remote_ssh "$relay_ip" "cd '${NFS_STAGING_DIR}' && sudo zip -r '${nfs_rollup}' '$(basename "${nfs_dir}")/' >/dev/null 2>&1" </dev/null
-            local rollup_sz
-            rollup_sz=$(remote_ssh "$relay_ip" "ls -lh '${nfs_rollup}' 2>/dev/null" | awk '{print $5}' | tr -d '\r')
-            [[ -n "$rollup_sz" ]] && log_success "Rollup: ${nfs_rollup} (${rollup_sz})"
-        fi
-    fi
 
     # cleanup local node results only
     for nn in "${NODE_IPS[@]}"; do
@@ -541,13 +545,13 @@ collect_and_upload_gdrive_from_node() {
     if [[ $uploaded -gt 0 ]]; then
         echo -e "${GREEN}${BOLD}  UPLOADED TO GOOGLE DRIVE${NC}"
         echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
-        echo -e "  ${CYAN}Drive:${NC}    ${drive_folder}/"
-        echo -e "  ${CYAN}Uploaded:${NC} ${uploaded} nodes"
-        [[ -n "$nfs_rollup" ]] && echo -e "  ${CYAN}Rollup:${NC}  ${nfs_rollup}"
-        [[ "$use_nfs" == true ]] && echo -e "  ${CYAN}NFS:${NC}     ${nfs_dir}/"
+        echo -e "  ${CYAN}Drive:${NC}  ${GDRIVE_FOLDER}/${rname}.zip"
+        echo -e "  ${CYAN}Nodes:${NC}  ${nfs_node_count}"
+        [[ -n "$nfs_rollup" ]] && echo -e "  ${CYAN}NFS:${NC}    ${nfs_rollup}"
     else
-        echo -e "${RED}${BOLD}  ALL UPLOADS FAILED${NC}"
+        echo -e "${RED}${BOLD}  UPLOAD FAILED${NC}"
         echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
+        [[ -n "$nfs_rollup" ]] && echo -e "  ${CYAN}NFS:${NC}    ${nfs_rollup} (still available)"
     fi
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
 }
