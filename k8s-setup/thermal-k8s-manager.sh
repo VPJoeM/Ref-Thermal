@@ -1179,7 +1179,23 @@ ENTRYPT
 extract_embedded_files
 trap "rm -f '$THERMAL_SCRIPT' '$JOB_TEMPLATE' '$NAMESPACE_YAML'; rm -rf '$DOCKERFILE_DIR'" EXIT
 
-# load saved password
+# load saved password, or prompt upfront so we fail fast
 [[ -f "$GDRIVE_PASS_FILE" ]] && GDRIVE_PASS=$(cat "$GDRIVE_PASS_FILE" 2>/dev/null)
+if [[ -z "$GDRIVE_PASS" ]]; then
+    echo ""
+    echo -e "${CYAN}Google Drive credentials required for result uploads.${NC}"
+    read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
+    _test_sa=$(mktemp /tmp/.gdrive-test-XXXX.json)
+    echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" > "$_test_sa" 2>/dev/null
+    if [[ $? -ne 0 || ! -s "$_test_sa" ]]; then
+        rm -f "$_test_sa"
+        log_error "Wrong password. Cannot decrypt Google Drive credentials."
+        GDRIVE_PASS=""
+        exit 1
+    fi
+    rm -f "$_test_sa"
+    echo "$GDRIVE_PASS" > "$GDRIVE_PASS_FILE" && chmod 600 "$GDRIVE_PASS_FILE"
+    log_success "Google Drive credentials verified"
+fi
 
 if [[ $# -gt 0 ]]; then parse_cli_args "$@" || run_menu; else run_menu; fi

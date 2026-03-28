@@ -1304,9 +1304,26 @@ echo "$THERMAL_SCRIPT_B64" | base64 -d | gunzip > "$THERMAL_SCRIPT" 2>/dev/null
 chmod +x "$THERMAL_SCRIPT"
 trap "rm -f '$THERMAL_SCRIPT'" EXIT
 
-# load saved Google Drive password if it exists
+# load saved Google Drive password, or prompt for it now so we fail fast
 if [[ -f "$GDRIVE_PASS_FILE" ]]; then
     GDRIVE_PASS=$(cat "$GDRIVE_PASS_FILE" 2>/dev/null)
+fi
+if [[ -z "$GDRIVE_PASS" ]]; then
+    echo ""
+    echo -e "${CYAN}Google Drive credentials required for result uploads.${NC}"
+    read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
+    # verify it decrypts
+    _test_sa=$(mktemp /tmp/.gdrive-test-XXXX.json)
+    echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" > "$_test_sa" 2>/dev/null
+    if [[ $? -ne 0 || ! -s "$_test_sa" ]]; then
+        rm -f "$_test_sa"
+        log_error "Wrong password. Cannot decrypt Google Drive credentials."
+        GDRIVE_PASS=""
+        exit 1
+    fi
+    rm -f "$_test_sa"
+    echo "$GDRIVE_PASS" > "$GDRIVE_PASS_FILE" && chmod 600 "$GDRIVE_PASS_FILE"
+    log_success "Google Drive credentials verified"
 fi
 
 if [[ $# -gt 0 ]]; then parse_cli_args "$@" || run_menu; else run_menu; fi
