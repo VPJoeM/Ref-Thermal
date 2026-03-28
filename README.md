@@ -130,6 +130,24 @@ bash thermal-pssh-manager.sh run \
   --output gdrive
 ```
 
+### Node File Format (`fleet.txt`)
+
+One IP per line. Comments and blank lines are ignored:
+
+```
+# SEA1 rack 12
+192.168.1.10
+192.168.1.11
+192.168.1.12
+
+# SEA1 rack 13
+192.168.1.20
+192.168.1.21
+192.168.1.22
+```
+
+You can also paste IPs directly when prompted in the menu -- space, comma, or newline separated.
+
 ---
 
 ## Troubleshooting
