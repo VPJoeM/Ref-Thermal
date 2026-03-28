@@ -818,6 +818,17 @@ select_nodes() {
 
         # test connectivity to each node, auto-detect proxy needs
         test_node_connectivity || return 1
+    else
+        # local mode: use internal IPs for SSH to nodes
+        for n in "${NODE_IPS[@]}"; do
+            local iip="${IP_MAP_INTERNAL[$n]:-}"
+            if [[ -n "$iip" ]]; then
+                NODE_PUBLIC_IPS["$n"]="$iip"
+                NODE_CONNECT["$iip"]="direct"
+                IP_MAP_HOSTNAME["$iip"]="$n"
+            fi
+        done
+        CONTROL_PLANE_IP="127.0.0.1"
     fi
     return 0
 }
