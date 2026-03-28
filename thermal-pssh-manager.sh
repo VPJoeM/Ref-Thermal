@@ -721,9 +721,15 @@ collect_to_node_then_gdrive() {
         ssh_cmd "$relay" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
     fi
 
-    # decrypt SA key directly onto the node -- never touches local disk
-    echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null \
-        | ssh_cmd "$relay" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json" </dev/null
+    # decrypt SA key and deploy to node
+    local _sa_json
+    _sa_json=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
+    if [[ -z "$_sa_json" ]]; then
+        log_error "Failed to decrypt Google Drive credentials"
+        return 1
+    fi
+    echo "$_sa_json" | ssh_cmd "$relay" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json"
+    unset _sa_json
     if ! ssh_cmd "$relay" "sudo test -s /tmp/.gdrive-sa.json" </dev/null 2>/dev/null; then
         log_error "Failed to deploy Google Drive credentials to node"
         return 1

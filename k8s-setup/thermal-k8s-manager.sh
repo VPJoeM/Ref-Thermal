@@ -435,9 +435,15 @@ collect_and_upload_gdrive_from_node() {
         log_info "Installing rclone on relay node..."
         remote_ssh "$relay_ip" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
     fi
-    # decrypt SA key directly onto the node -- never touches local disk
-    echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null \
-        | remote_ssh "$relay_ip" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json" </dev/null
+    # decrypt SA key and deploy to node
+    local _sa_json
+    _sa_json=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
+    if [[ -z "$_sa_json" ]]; then
+        log_error "Failed to decrypt Google Drive credentials"
+        return 1
+    fi
+    echo "$_sa_json" | remote_ssh "$relay_ip" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json"
+    unset _sa_json
     if ! remote_ssh "$relay_ip" "sudo test -s /tmp/.gdrive-sa.json" </dev/null 2>/dev/null; then
         log_error "Failed to deploy Google Drive credentials to node"
         return 1
@@ -683,9 +689,11 @@ collect_and_rollup() {
                 remote_ssh "$gdrive_node_ip" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
             fi
 
-            # decrypt SA key directly onto the node
-            echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null \
-                | remote_ssh "$gdrive_node_ip" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json" </dev/null
+            # decrypt SA key and deploy to node
+            local _sa_json2
+            _sa_json2=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
+            echo "$_sa_json2" | remote_ssh "$gdrive_node_ip" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json"
+            unset _sa_json2
             if ! remote_ssh "$gdrive_node_ip" "sudo test -s /tmp/.gdrive-sa.json" </dev/null 2>/dev/null; then
                 log_error "Failed to deploy Google Drive credentials to node"
                 break
