@@ -1,108 +1,117 @@
 # Reflection Thermal Diagnostics
 
-Automated GPU thermal diagnostics for Dell PowerEdge servers with NVIDIA GPUs. Runs Dell's dcgmprofrunner thermal stress test across a fleet of nodes in parallel, collects results, and uploads to Google Drive.
+Automated GPU thermal diagnostics for Dell PowerEdge servers with NVIDIA H100 GPUs. Runs Dell's thermal stress test across your fleet in parallel, collects TSR reports, and uploads everything to Google Drive.
 
-Two self-contained scripts -- no dependencies to install, no config files to manage. Each script is a single file that contains everything it needs.
+Single file, self-contained -- nothing to install or configure beforehand.
 
 ---
 
-## Quick Start
+## Step-by-Step Guide
 
-**You run these scripts from your laptop/workstation, NOT on the GPU nodes.** The scripts SSH into the nodes remotely to run the tests.
+### 1. Prerequisites
 
-### Bare Metal (no Kubernetes)
+On **your Mac/laptop** (where you run the script from):
+
+- `pssh` installed: `brew install pssh`
+- An SSH key that can reach your nodes (e.g. `~/.ssh/id_ed25519`)
+- The Google Drive password (ask your team if you don't have it)
+
+On **every GPU node** you want to test:
+
+- Your SSH key's public key in `~/.ssh/authorized_keys` for the `ubuntu` user
+- The `ubuntu` user must have **passwordless sudo**
+- No GPU workloads running during the test
+
+### 2. Verify SSH Access
+
+Before running, confirm you can reach each node:
+
+```
+ssh -i ~/.ssh/your_key ubuntu@NODE_IP "hostname && sudo whoami"
+```
+
+You should see the hostname and `root`. If not, fix SSH access first.
+
+### 3. Download and Run
+
+Open a terminal on your Mac and run:
 
 ```
 curl -sLO https://raw.githubusercontent.com/VPJoeM/Ref-Thermal/main/thermal-pssh-manager.sh && bash thermal-pssh-manager.sh
 ```
 
-### Kubernetes Cluster
+### 4. Enter the Google Drive Password
+
+On first run, you'll be prompted for the Google Drive password. This is saved locally so you won't be asked again.
+
+### 5. Follow the Menu
+
+The script presents a simple menu:
+
+```
+1) Run Thermal Diagnostics  ← start here
+2) Rerun Last               ← repeat previous run
+```
+
+Select **1** for a new run. You'll be asked:
+
+1. **SSH user** -- press Enter for default (`ubuntu`)
+2. **SSH key** -- pick from the list or enter a path
+3. **Node IPs** -- paste your list of IPs (space or comma separated)
+
+### 6. Wait ~30 Minutes
+
+The script handles everything from here:
+
+- Uploads the test script to all nodes
+- Runs a 15-minute GPU stress test in parallel
+- Collects Dell SupportAssist TSR reports from each node's iDRAC
+- Merges GPU temperature, power, and clock data into CSV
+
+You'll see live progress:
+
+```
+  05:23  1/10 done  0 failed |  g0799: GPU stress  g0890: TSR 45%
+```
+
+### 7. Results Upload
+
+When all nodes finish, results are automatically:
+
+1. Copied to the shared NFS (`/data/thermal-jm-VP-Diag/`) if available
+2. Uploaded to the Reflection Google Team Drive
+
+Each node produces one zip file. You'll see the Drive folder path when complete:
+
+```
+  UPLOADED TO GOOGLE DRIVE
+  Drive:    thermal-results/sea1-20260328-142530/
+  Uploaded: 10 nodes
+  NFS:     /data/thermal-jm-VP-Diag/sea1-20260328-142530/
+```
+
+### 8. Next Run
+
+Select **2) Rerun Last** from the menu to repeat with the same nodes and settings.
+
+---
+
+## Kubernetes Version
+
+If your nodes are in a K8s cluster:
 
 ```
 curl -sLO https://raw.githubusercontent.com/VPJoeM/Ref-Thermal/main/k8s-setup/thermal-k8s-manager.sh && bash thermal-k8s-manager.sh
 ```
 
----
-
-## Before You Run
-
-### Bare Metal Version -- What You Need
-
-1. **Your laptop/Mac** with `pssh` installed (`brew install pssh`)
-2. **An SSH private key** on your laptop (e.g. `~/.ssh/id_ed25519`)
-3. **That key's public key must be in `~/.ssh/authorized_keys` on EVERY node** you want to test
-4. **The SSH user** (default: `ubuntu`) must have **passwordless sudo** on every node
-5. **A list of node IPs** (or a file with one IP per line)
-6. **No GPU workloads running** on the target nodes during testing
-
-How to verify your setup before running:
-```
-ssh -i ~/.ssh/your_key ubuntu@NODE_IP "hostname && sudo whoami"
-# should print the hostname and "root"
-```
-
-If that doesn't work on ANY node, the script will fail on that node.
-
-### Kubernetes Version -- What You Need
-
-1. **Your laptop/Mac** with SSH access to the K8s control plane node
-2. **The control plane's public IP** (you'll enter it when prompted)
-3. **The public IP for each worker node** (for collecting results after the test)
-4. **Your SSH key's public key in `~/.ssh/authorized_keys`** on each node
-5. **NVIDIA GPU Operator** running in the cluster
-6. **Docker** installed on the nodes (the script builds a container image on first run)
-
----
-
-## How It Works
-
-1. You run the script **on your laptop**
-2. The script connects to your nodes via SSH
-3. It deploys and runs a ~15-minute GPU thermal stress test on all nodes in parallel
-4. While the test runs, it collects Dell SupportAssist TSR reports
-5. After completion, results are uploaded to Google Drive (or saved to NFS/node)
-
-Total runtime: approximately 25-30 minutes per run.
-
----
-
-## Output
-
-Results are uploaded as individual per-node zips into a Google Drive folder:
-
-```
-thermal-results/sea1-20260327-124745/
-  ├── g329-7871FZ3.zip       (hostname-ServiceTag)
-  ├── g330-DV42FZ3.zip
-  └── ...
-```
-
-Each node zip contains the full Dell thermal diagnostics package:
-- `thermal_results.hostname.1004.900.date.csv` -- GPU temperature, power, clock data
-- `dcgmproftester.log` -- GPU stress test log
-- `tensor_active_0-7.results` -- per-GPU tensor activity results
-- `TSR_SVCTAG_date.zip` -- Dell SupportAssist Technical Support Report
-
-If NFS is available (`/data/thermal-jm-VP-Diag/`), results are also staged there for fast access.
-
----
-
-## Output Destinations
-
-| Option | What happens |
-|--------|-------------|
-| **Google Drive** (default) | Per-node zips uploaded to the Reflection Team Drive |
-| **Local** | Results stay on each node at `/root/TDAS/` |
-| **Node** | All results collected onto one designated node |
-| **NFS** | If `/data/` is mounted, results are also staged on shared NFS automatically |
+Same flow -- provide the control plane IP and worker node IPs. The script deploys K8s Jobs instead of using pssh.
 
 ---
 
 ## CLI Mode
 
-For automation or repeated runs, both scripts support non-interactive mode:
+For automation or scripting, skip the menu:
 
-### Bare Metal
 ```
 bash thermal-pssh-manager.sh run \
   --user ubuntu \
@@ -111,16 +120,8 @@ bash thermal-pssh-manager.sh run \
   --output gdrive
 ```
 
-### Kubernetes
-```
-bash thermal-k8s-manager.sh run \
-  --control-plane 10.0.1.50 \
-  --nodes "node1 node2 node3" \
-  --node-ips "node1:10.0.1.50,node2:10.0.1.51,node3:10.0.1.52" \
-  --output gdrive
-```
+Or load nodes from a file:
 
-### Load nodes from a file
 ```
 bash thermal-pssh-manager.sh run \
   --user ubuntu \
@@ -129,4 +130,14 @@ bash thermal-pssh-manager.sh run \
   --output gdrive
 ```
 
-Where `fleet.txt` has one IP per line.
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| SSH connection failed | Add your public key to `~/.ssh/authorized_keys` on the node |
+| sudo password required | Add `ubuntu ALL=(ALL) NOPASSWD:ALL` to `/etc/sudoers` |
+| Too many auth failures | Use `--key` to specify the exact key |
+| SupportAssist job running | Wait or run `sudo racadm jobqueue delete -i JID_CLEARALL` on the node |
+| Wrong Google Drive password | Delete `/tmp/.thermal-gdrive-pass` and re-enter |
