@@ -203,6 +203,22 @@ test_all_nodes_connectivity() {
 GDRIVE_SA_ENC="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"
 GDRIVE_PASS=""
 
+# decrypt the SA key to a local temp file
+decrypt_gdrive_sa() {
+    local outfile="$1"
+    if [[ -z "$GDRIVE_PASS" ]]; then
+        read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
+    fi
+    echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" > "$outfile" 2>/dev/null
+    if [[ $? -ne 0 || ! -s "$outfile" ]]; then
+        log_error "Wrong Google Drive password"
+        GDRIVE_PASS=""
+        rm -f "$outfile" "$GDRIVE_PASS_FILE"
+        return 1
+    fi
+    echo "$GDRIVE_PASS" > "$GDRIVE_PASS_FILE" && chmod 600 "$GDRIVE_PASS_FILE"
+}
+
 # decrypt and push the SA key to a remote node
 push_gdrive_sa_key() {
     local host="$1"

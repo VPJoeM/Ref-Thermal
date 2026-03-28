@@ -37,7 +37,6 @@ curl -sLO https://raw.githubusercontent.com/VPJoeM/Ref-Thermal/main/k8s-setup/th
 
 How to verify your setup before running:
 ```
-# test SSH to a node
 ssh -i ~/.ssh/your_key ubuntu@NODE_IP "hostname && sudo whoami"
 # should print the hostname and "root"
 ```
@@ -49,11 +48,9 @@ If that doesn't work on ANY node, the script will fail on that node.
 1. **Your laptop/Mac** with SSH access to the K8s control plane node
 2. **The control plane's public IP** (you'll enter it when prompted)
 3. **The public IP for each worker node** (for collecting results after the test)
-4. **Your SSH key's public key in `~/.ssh/authorized_keys`** on each node (needed for result collection -- K8s handles the actual test execution)
+4. **Your SSH key's public key in `~/.ssh/authorized_keys`** on each node
 5. **NVIDIA GPU Operator** running in the cluster
 6. **Docker** installed on the nodes (the script builds a container image on first run)
-
-The K8s version uses sshv (if available) or standard SSH to reach nodes. It auto-detects which method works.
 
 ---
 
@@ -61,23 +58,23 @@ The K8s version uses sshv (if available) or standard SSH to reach nodes. It auto
 
 1. You run the script **on your laptop**
 2. The script connects to your nodes via SSH
-3. It deploys and runs a 15-minute GPU thermal stress test on all nodes in parallel
+3. It deploys and runs a ~15-minute GPU thermal stress test on all nodes in parallel
 4. While the test runs, it collects Dell SupportAssist TSR reports
-5. After completion, it packages all results into a single zip
-6. Optionally uploads the zip to Google Drive
+5. After completion, results are uploaded to Google Drive (or saved to NFS/node)
 
 Total runtime: approximately 25-30 minutes per run.
 
 ---
 
-## Output Format
+## Output
 
-The script produces one zip file containing individual per-node zips:
+Results are uploaded as individual per-node zips into a Google Drive folder:
 
 ```
-sea1-20260327-124745.zip
-  |-- g329-7871FZ3.zip       (hostname-ServiceTag)
-  |-- g330-DV42FZ3.zip
+thermal-results/sea1-20260327-124745/
+  ├── g329-7871FZ3.zip       (hostname-ServiceTag)
+  ├── g330-DV42FZ3.zip
+  └── ...
 ```
 
 Each node zip contains the full Dell thermal diagnostics package:
@@ -86,37 +83,18 @@ Each node zip contains the full Dell thermal diagnostics package:
 - `tensor_active_0-7.results` -- per-GPU tensor activity results
 - `TSR_SVCTAG_date.zip` -- Dell SupportAssist Technical Support Report
 
-This output format is compatible with Dell's thermal analysis tools.
+If NFS is available (`/data/thermal-jm-VP-Diag/`), results are also staged there for fast access.
 
 ---
 
 ## Output Destinations
 
-When prompted for output destination, you can choose:
-
 | Option | What happens |
 |--------|-------------|
-| **Local** | Results stay on each node at `/root/TDAS/` -- you collect manually |
-| **Node** | All results are collected onto one designated node |
-| **Google Drive** | Results are uploaded to the Reflection Team Drive (password required) |
-| **FTP** | Results are uploaded to an FTP server you specify |
-
-### Google Drive Password
-
-When you select Google Drive as the output, you'll be prompted for a password on first use. This password decrypts the embedded Google Drive credentials. The password is saved locally so you won't be asked again on subsequent runs.
-
-Contact your team lead for the password.
-
----
-
-## SSH Proxy / Jump Host
-
-Some nodes can't be reached via their public IP and require a jump host. Both scripts handle this automatically:
-
-1. The script tries direct SSH to each node
-2. If direct SSH fails, it prompts you for the node's **private IP**
-3. It then routes through the jump host using that private IP
-4. This is cached for the session -- you only enter it once per node
+| **Google Drive** (default) | Per-node zips uploaded to the Reflection Team Drive |
+| **Local** | Results stay on each node at `/root/TDAS/` |
+| **Node** | All results collected onto one designated node |
+| **NFS** | If `/data/` is mounted, results are also staged on shared NFS automatically |
 
 ---
 
@@ -152,17 +130,3 @@ bash thermal-pssh-manager.sh run \
 ```
 
 Where `fleet.txt` has one IP per line.
-
----
-
-## Troubleshooting
-
-**"SSH connection failed"** -- Your SSH key isn't authorized on the node. Add your public key to `~/.ssh/authorized_keys` on that node.
-
-**"sudo password required"** -- The SSH user needs passwordless sudo. Add `ubuntu ALL=(ALL) NOPASSWD:ALL` to `/etc/sudoers` on the node.
-
-**"Too many authentication failures"** -- Too many SSH keys in your agent. Use `--key` to specify the exact key.
-
-**"Wrong Google Drive password"** -- Contact your team lead for the correct password.
-
-**"SupportAssist job already running"** -- A previous TSR collection is still running on the iDRAC. Wait for it to finish or clear it with `sudo racadm jobqueue delete -i JID_CLEARALL` on the node.
