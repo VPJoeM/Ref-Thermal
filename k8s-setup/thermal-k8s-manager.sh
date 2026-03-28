@@ -820,15 +820,42 @@ select_nodes() {
     if [[ "$EXECUTION_MODE" == "remote" && -z "$CONTROL_PLANE_IP" ]]; then
         echo -e "${CYAN}${BOLD}[1/2] Cluster Access${NC}"
 
-        # prompt for SSH user and key if not set via CLI
-        if [[ "$DEFAULT_SSH_USER" == "ubuntu" ]]; then
-            read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
-        fi
-        if [[ "$DEFAULT_SSH_KEY" == "$HOME/.ssh/id_ed25519" ]]; then
+        read -p "  SSH username [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
+
+        # scan ~/.ssh for private keys and present a picker
+        local keys=() key_labels=()
+        while IFS= read -r kf; do
+            [[ "$kf" == *.pub || "$kf" == *.crt || "$kf" == *known_hosts* || "$kf" == *authorized_keys* || "$kf" == *config* ]] && continue
+            [[ ! -f "$kf" ]] && continue
+            if head -1 "$kf" 2>/dev/null | grep -qE "PRIVATE KEY|OPENSSH"; then
+                keys+=("$kf")
+                local bn; bn=$(basename "$kf")
+                local ktype; ktype=$(ssh-keygen -l -f "$kf" 2>/dev/null | awk '{print $4}' | tr -d '()')
+                key_labels+=("${bn} ${DIM}(${ktype:-unknown})${NC}")
+            fi
+        done < <(find ~/.ssh -maxdepth 1 -type f 2>/dev/null | sort)
+
+        if [[ ${#keys[@]} -gt 0 ]]; then
+            echo ""
+            echo -e "  ${CYAN}Available SSH keys:${NC}"
+            for i in "${!keys[@]}"; do
+                echo -e "    ${GREEN}$((i+1)))${NC} ${key_labels[$i]}"
+            done
+            echo -e "    ${GREEN}$((${#keys[@]}+1)))${NC} Enter path manually"
+            echo ""
+            read -p "  Select key [1-$((${#keys[@]}+1))]: " key_choice
+            if [[ "$key_choice" =~ ^[0-9]+$ ]] && [[ "$key_choice" -ge 1 ]] && [[ "$key_choice" -le "${#keys[@]}" ]]; then
+                DEFAULT_SSH_KEY="${keys[$((key_choice-1))]}"
+            else
+                read -e -p "  Key path: " DEFAULT_SSH_KEY
+                DEFAULT_SSH_KEY="${DEFAULT_SSH_KEY/#\~/$HOME}"
+            fi
+        else
             read -e -p "  SSH key path [$DEFAULT_SSH_KEY]: " sk
             DEFAULT_SSH_KEY="${sk:-$DEFAULT_SSH_KEY}"
             DEFAULT_SSH_KEY="${DEFAULT_SSH_KEY/#\~/$HOME}"
         fi
+        echo -e "  ${GREEN}Using: $(basename "$DEFAULT_SSH_KEY")${NC}"
         [[ ! -f "$DEFAULT_SSH_KEY" ]] && { log_error "Key not found: $DEFAULT_SSH_KEY"; return 1; }
 
         echo -e "${DIM}  Control plane IP${NC}"
