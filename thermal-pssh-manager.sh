@@ -1410,6 +1410,28 @@ run_menu() {
 
 # ─── Entry Point ──────────────────────────────────────────────
 
+# auto-launch inside screen so the run survives disconnects
+if [[ -z "${STY:-}" && -z "${THERMAL_IN_SCREEN:-}" ]]; then
+    if ! command -v screen &>/dev/null; then
+        echo "Installing screen..."
+        if command -v brew &>/dev/null; then
+            brew install screen >/dev/null 2>&1
+        elif command -v apt-get &>/dev/null; then
+            sudo apt-get install -y screen >/dev/null 2>&1
+        fi
+    fi
+    if command -v screen &>/dev/null; then
+        SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+        echo ""
+        echo -e "\033[0;36mStarting in screen session 'thermal'...\033[0m"
+        echo -e "\033[2m  • Detach anytime:  Ctrl+A then D"
+        echo -e "  • Reattach:        screen -r thermal\033[0m"
+        echo ""
+        sleep 2
+        exec screen -S thermal bash -c "THERMAL_IN_SCREEN=1 bash '$SCRIPT_PATH' $*; echo ''; echo 'Press Enter to exit screen...'; read"
+    fi
+fi
+
 # extract embedded thermal diagnostics script
 echo "$THERMAL_SCRIPT_B64" | base64 -d | gunzip > "$THERMAL_SCRIPT" 2>/dev/null
 chmod +x "$THERMAL_SCRIPT"
