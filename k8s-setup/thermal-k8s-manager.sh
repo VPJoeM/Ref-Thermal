@@ -475,17 +475,23 @@ collect_and_upload_gdrive_from_node() {
             --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
             --drive-scope drive -v 2>&1" 2>/dev/null)
 
-    # cleanup
+    # cleanup SA key and rclone
     remote_ssh "$collect_ip" "sudo rm -f /tmp/.gdrive-sa.json" 2>/dev/null
     [[ -z "$has_rc" ]] && remote_ssh "$collect_ip" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
 
     echo ""
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
     if echo "$upload_out" | grep -qi "transferred\|copied"; then
+        # cleanup rollup and per-node results after successful upload
+        remote_ssh "$collect_ip" "sudo rm -rf /root/Reports/thermal-results/${rname}*" 2>/dev/null
+        for nn in "${NODE_IPS[@]}"; do
+            local pip="${NODE_PUBLIC_IPS[$nn]:-}"
+            [[ -n "$pip" ]] && remote_ssh "$pip" "sudo rm -f /root/TDAS/dcgmprof-*.zip" </dev/null 2>/dev/null &
+        done
+        wait
         echo -e "${GREEN}${BOLD}  UPLOADED TO GOOGLE DRIVE${NC}"
         echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
         echo -e "  ${CYAN}Drive:${NC}  ${GDRIVE_FOLDER}/${rname}.zip"
-        echo -e "  ${CYAN}Node:${NC}   ${collect_ip}:${remote_zip}"
         echo -e "  ${CYAN}Nodes:${NC}  ${collected}"
     else
         echo -e "${YELLOW}${BOLD}  RESULTS SAVED (Drive upload may have failed)${NC}"
@@ -659,9 +665,16 @@ collect_and_rollup() {
             fi ;;
     esac
 
-    mkdir -p "$REPORTS_DIR"
-    mv "$lzip" "${REPORTS_DIR}/${rname}.zip"
-    log_success "Local copy: ${REPORTS_DIR}/${rname}.zip"
+    # only keep local copy if upload didn't happen
+    if [[ "${OUTPUT_MODE}" == "local" ]]; then
+        mkdir -p "$REPORTS_DIR"
+        mv "$lzip" "${REPORTS_DIR}/${rname}.zip"
+        log_success "Local copy: ${REPORTS_DIR}/${rname}.zip"
+    else
+        rm -f "$lzip"
+        rm -rf "/tmp/${rname}"
+        log_info "Local temp files cleaned up"
+    fi
 }
 
 # ─── Interactive Menu ─────────────────────────────────────────
