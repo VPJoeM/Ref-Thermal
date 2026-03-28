@@ -463,11 +463,14 @@ WRAPPER_EOF
 
     # track per-node state
     declare -A node_state
-    for ip in "${NODE_IPS[@]}"; do node_state["$ip"]="running"; done
+    for ip in "${NODE_IPS[@]}"; do node_state["$ip"]="pending"; done
 
     local start_time; start_time=$(date +%s)
 
     echo -e "  ${DIM}────────────────────────────────────────────────────${NC}"
+
+    # first poll after 60s to let nodes actually start
+    sleep 60
 
     # wait for any background job (pssh or individual proxy ssh)
     while jobs -r 2>/dev/null | grep -q .; do
