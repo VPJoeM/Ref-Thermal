@@ -16,6 +16,7 @@ IMAGE_TAG="2.6.2"
 IMAGE_FULL="${IMAGE_NAME}:${IMAGE_TAG}"
 REPORTS_DIR="${HOME}/Reports/thermal-diagnostics"
 GDRIVE_PASS_FILE="/tmp/.thermal-gdrive-pass"
+NFS_STAGING_DIR="/data/thermal-jm-VP-Diag"
 
 DEFAULT_SSH_USER="${SSH_USER:-ubuntu}"
 DEFAULT_SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
@@ -388,116 +389,147 @@ monitor_jobs() {
 
 # ─── Results Collection ──────────────────────────────────────
 
-# gdrive mode: collect on first node, create rollup, upload from there
+# gdrive mode: collect results and upload to Google Drive
+# uses NFS staging when available, falls back to SSH relay
 collect_and_upload_gdrive_from_node() {
     local run_id="$1" rname="$2"
-    local collect_ip="${NODE_PUBLIC_IPS[${NODE_IPS[0]}]:-$CONTROL_PLANE_IP}"
-    local rollup_dir="/root/Reports/thermal-results/${rname}"
+    local relay_ip="${NODE_PUBLIC_IPS[${NODE_IPS[0]}]:-$CONTROL_PLANE_IP}"
+    local drive_folder="${GDRIVE_FOLDER}/${rname}"
 
-    log_info "Collecting results on node, then uploading to Google Drive..."
-
-    # create rollup dir on collection node
-    remote_ssh "$collect_ip" "sudo mkdir -p '${rollup_dir}'" 2>/dev/null
-
-    # get node list
+    # get node list from K8s jobs
     local jnodes=""
     jnodes=$(remote_ssh "$CONTROL_PLANE_IP" \
         "sudo kubectl get jobs -n thermal-diagnostics -l thermal-run=${run_id} -o jsonpath='{range .items[*]}{.spec.template.spec.nodeName}{\"\\n\"}{end}'" 2>/dev/null)
     [[ -z "$jnodes" ]] && jnodes=$(echo "${NODE_IPS[*]}" | tr ' ' '\n')
 
-    local collected=0
-    while read -r nn <&3; do
-        [[ -z "$nn" ]] && continue
-        echo -e "  ${YELLOW}→${NC} Collecting from ${nn}..."
-        local pub_ip="${NODE_PUBLIC_IPS[$nn]:-$CONTROL_PLANE_IP}"
-
-        local rzip
-        rzip=$(remote_ssh "$pub_ip" \
-            "sudo bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1'" </dev/null | tr -d '\r')
-        [[ -z "$rzip" ]] && { log_warn "No results on $nn"; continue; }
-
-        local zb; zb=$(basename "$rzip")
-        local st; st=$(echo "$zb" | sed -E 's/^dcgmprof-([^-]+)-.*/\1/')
-        [[ "$st" == "$zb" ]] && st="UNKNOWN"
-        local nzn="${nn}-${st}.zip"
-
-        if [[ "$pub_ip" == "$collect_ip" ]]; then
-            remote_ssh "$collect_ip" "sudo cp '$rzip' '${rollup_dir}/${nzn}'" 2>/dev/null
-        else
-            # download from source node to Mac, upload to collection node
+    # check if NFS staging is available
+    local use_nfs=false
+    local nfs_dir="${NFS_STAGING_DIR}/${rname}"
+    if remote_ssh "$relay_ip" "test -d '${NFS_STAGING_DIR}'" 2>/dev/null; then
+        remote_ssh "$relay_ip" "sudo mkdir -p '${nfs_dir}'" 2>/dev/null
+        # stage each node's results to NFS
+        log_info "Staging results to NFS..."
+        while read -r nn <&3; do
+            [[ -z "$nn" ]] && continue
+            local pub_ip="${NODE_PUBLIC_IPS[$nn]:-$CONTROL_PLANE_IP}"
             remote_ssh "$pub_ip" \
-                "sudo bash -c 'cp \"$rzip\" /tmp/thermal-relay.zip && chmod 644 /tmp/thermal-relay.zip'" 2>/dev/null
-            remote_scp_from "$pub_ip" "/tmp/thermal-relay.zip" "/tmp/${nzn}"
-            remote_scp_to "$collect_ip" "/tmp/${nzn}" "/tmp/${nzn}"
-            remote_ssh "$collect_ip" "sudo mv '/tmp/${nzn}' '${rollup_dir}/${nzn}'" 2>/dev/null
-            rm -f "/tmp/${nzn}"
-            remote_ssh "$pub_ip" "rm -f /tmp/thermal-relay.zip" 2>/dev/null
-        fi
+                "sudo bash -c 'rzip=\$(ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1); \
+                 if [ -n \"\$rzip\" ]; then \
+                     hn=\$(hostname -s); st=\$(basename \"\$rzip\" | sed -E \"s/^dcgmprof-([^-]+)-.*/\\1/\"); \
+                     [ \"\$st\" = \"\$(basename \"\$rzip\")\" ] && st=UNKNOWN; \
+                     cp \"\$rzip\" \"${nfs_dir}/\${hn}-\${st}.zip\" 2>/dev/null && echo OK; \
+                 fi'" </dev/null 2>/dev/null &
+        done 3<<< "$jnodes"
+        wait
 
-        local verify
-        verify=$(remote_ssh "$collect_ip" "sudo ls -lh '${rollup_dir}/${nzn}' 2>/dev/null" 2>/dev/null | tr -d '\r')
-        if [[ -n "$verify" ]]; then
-            local zs; zs=$(echo "$verify" | awk '{print $5}')
-            echo -e "  ${GREEN}✓${NC} ${nzn} (${zs})"
-            collected=$((collected+1))
-        else
-            log_warn "Failed to collect from $nn"
-        fi
-    done 3<<< "$jnodes"
-
-    [[ $collected -eq 0 ]] && { log_error "No results collected"; return 1; }
-
-    # create rollup zip on the node
-    local remote_zip="/root/Reports/thermal-results/${rname}.zip"
-    log_info "Creating rollup on node..."
-    remote_ssh "$collect_ip" \
-        "sudo bash -c 'cd /root/Reports/thermal-results && zip -r ${rname}.zip ${rname}/ >/dev/null 2>&1 && rm -rf ${rname}/'" 2>/dev/null
-
-    # install rclone, push SA key, upload
-    local has_rc
-    has_rc=$(remote_ssh "$collect_ip" "which rclone 2>/dev/null" 2>/dev/null)
-    if [[ -z "$has_rc" ]]; then
-        log_info "Installing rclone..."
-        remote_ssh "$collect_ip" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
+        local nfs_count
+        nfs_count=$(remote_ssh "$relay_ip" "ls '${nfs_dir}'/*.zip 2>/dev/null | wc -l" | tr -d '\r ')
+        [[ "${nfs_count:-0}" -gt 0 ]] && use_nfs=true
     fi
 
+    # install rclone + SA key on relay
+    local had_rclone="yes"
+    local has_rc; has_rc=$(remote_ssh "$relay_ip" "which rclone 2>/dev/null" 2>/dev/null | tr -d '\r')
+    if [[ -z "$has_rc" ]]; then
+        had_rclone="no"
+        log_info "Installing rclone on relay node..."
+        remote_ssh "$relay_ip" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
+    fi
     local sa_tmp="/tmp/.gdrive-sa-local-$$.json"
     decrypt_gdrive_sa "$sa_tmp" || return 1
-    remote_scp_to "$collect_ip" "$sa_tmp" "/tmp/.gdrive-sa.json"
-    remote_ssh "$collect_ip" "sudo chmod 600 /tmp/.gdrive-sa.json"
+    remote_scp_to "$relay_ip" "$sa_tmp" "/tmp/.gdrive-sa.json"
+    remote_ssh "$relay_ip" "sudo chmod 600 /tmp/.gdrive-sa.json"
     rm -f "$sa_tmp"
 
-    log_info "Uploading ${rname}.zip to Google Drive..."
-    local upload_out
-    upload_out=$(remote_ssh "$collect_ip" \
-        "sudo rclone copyto '${remote_zip}' ':drive:${GDRIVE_FOLDER}/${rname}.zip' \
-            --drive-service-account-file /tmp/.gdrive-sa.json \
-            --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
-            --drive-scope drive -v 2>&1" 2>/dev/null)
+    local uploaded=0
 
-    # cleanup SA key and rclone
-    remote_ssh "$collect_ip" "sudo rm -f /tmp/.gdrive-sa.json" 2>/dev/null
-    [[ -z "$has_rc" ]] && remote_ssh "$collect_ip" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
+    if [[ "$use_nfs" == true ]]; then
+        log_info "Uploading from NFS → Google Drive: ${drive_folder}/"
+        while IFS= read -r zipfile <&3; do
+            [[ -z "$zipfile" ]] && continue
+            local nzn; nzn=$(basename "$zipfile")
+            local zs; zs=$(remote_ssh "$relay_ip" "ls -lh '${zipfile}'" | awk '{print $5}' | tr -d '\r')
+            echo -ne "  ${YELLOW}→${NC} ${nzn} (${zs})..."
+
+            remote_ssh "$relay_ip" \
+                "sudo rclone copyto '${zipfile}' ':drive:${drive_folder}/${nzn}' \
+                 --drive-service-account-file /tmp/.gdrive-sa.json \
+                 --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
+                 --drive-scope drive 2>&1" >/dev/null 2>&1
+
+            if [[ $? -eq 0 ]]; then
+                echo -e " ${GREEN}✓${NC}"
+                uploaded=$((uploaded + 1))
+            else
+                echo -e " ${RED}failed${NC}"
+            fi
+        done 3< <(remote_ssh "$relay_ip" "ls '${nfs_dir}'/*.zip 2>/dev/null" | tr -d '\r')
+    else
+        # SSH relay fallback (same as before)
+        log_info "Uploading via SSH relay → Google Drive: ${drive_folder}/"
+        while read -r nn <&3; do
+            [[ -z "$nn" ]] && continue
+            local pub_ip="${NODE_PUBLIC_IPS[$nn]:-$CONTROL_PLANE_IP}"
+            echo -ne "  ${YELLOW}→${NC} ${nn}..."
+
+            local rzip
+            rzip=$(remote_ssh "$pub_ip" \
+                "sudo bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1'" </dev/null | tr -d '\r')
+            if [[ -z "$rzip" ]]; then
+                echo -e " ${RED}no results${NC}"
+                continue
+            fi
+
+            local zb st nzn
+            zb=$(basename "$rzip")
+            st=$(echo "$zb" | sed -E 's/^dcgmprof-([^-]+)-.*/\1/')
+            [[ "$st" == "$zb" ]] && st="UNKNOWN"
+            nzn="${nn}-${st}.zip"
+
+            remote_ssh "$pub_ip" "sudo cp '$rzip' /tmp/thermal-relay.zip && sudo chmod 644 /tmp/thermal-relay.zip" 2>/dev/null
+            remote_scp_from "$pub_ip" "/tmp/thermal-relay.zip" "/tmp/${nzn}"
+
+            local ul_out
+            ul_out=$(remote_ssh "$relay_ip" \
+                "sudo rclone copyto '/tmp/${nzn}' ':drive:${drive_folder}/${nzn}' \
+                 --drive-service-account-file /tmp/.gdrive-sa.json \
+                 --drive-team-drive '${GDRIVE_TEAM_DRIVE}' \
+                 --drive-scope drive 2>&1" 2>/dev/null)
+
+            rm -f "/tmp/${nzn}"
+            remote_ssh "$pub_ip" "rm -f /tmp/thermal-relay.zip" 2>/dev/null
+
+            if [[ $? -eq 0 ]]; then
+                echo -e " ${GREEN}✓${NC}"
+                uploaded=$((uploaded + 1))
+            else
+                echo -e " ${RED}failed${NC}"
+            fi
+        done 3<<< "$jnodes"
+    fi
+
+    # cleanup rclone + SA key (never touch NFS)
+    remote_ssh "$relay_ip" "sudo rm -f /tmp/.gdrive-sa.json" 2>/dev/null
+    [[ "$had_rclone" == "no" ]] && remote_ssh "$relay_ip" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
+
+    # cleanup local node results only
+    for nn in "${NODE_IPS[@]}"; do
+        local pip="${NODE_PUBLIC_IPS[$nn]:-}"
+        [[ -n "$pip" ]] && remote_ssh "$pip" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/*" </dev/null 2>/dev/null &
+    done
+    wait
 
     echo ""
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
-    if echo "$upload_out" | grep -qi "transferred\|copied"; then
-        # cleanup rollup and per-node results after successful upload
-        remote_ssh "$collect_ip" "sudo rm -rf /root/Reports/thermal-results/${rname}*" 2>/dev/null
-        for nn in "${NODE_IPS[@]}"; do
-            local pip="${NODE_PUBLIC_IPS[$nn]:-}"
-            [[ -n "$pip" ]] && remote_ssh "$pip" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/*" </dev/null 2>/dev/null &
-        done
-        wait
+    if [[ $uploaded -gt 0 ]]; then
         echo -e "${GREEN}${BOLD}  UPLOADED TO GOOGLE DRIVE${NC}"
         echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
-        echo -e "  ${CYAN}Drive:${NC}  ${GDRIVE_FOLDER}/${rname}.zip"
-        echo -e "  ${CYAN}Nodes:${NC}  ${collected}"
+        echo -e "  ${CYAN}Drive:${NC}    ${drive_folder}/"
+        echo -e "  ${CYAN}Uploaded:${NC} ${uploaded} nodes"
+        [[ "$use_nfs" == true ]] && echo -e "  ${CYAN}NFS:${NC}     ${nfs_dir}/"
     else
-        echo -e "${YELLOW}${BOLD}  RESULTS SAVED (Drive upload may have failed)${NC}"
+        echo -e "${RED}${BOLD}  ALL UPLOADS FAILED${NC}"
         echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
-        echo -e "  ${CYAN}Node:${NC}   ${collect_ip}:${remote_zip}"
-        echo -e "  ${CYAN}Nodes:${NC}  ${collected}"
     fi
     echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
 }
