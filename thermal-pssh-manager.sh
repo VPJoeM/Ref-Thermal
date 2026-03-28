@@ -712,10 +712,7 @@ collect_to_node_then_gdrive() {
     local relay="${NODE_IPS[0]}"
     local drive_folder="${GDRIVE_FOLDER}/${rname}"
 
-    # pick upload node -- any node with rclone or internet access
-    local sa_tmp="/tmp/.gdrive-sa-$$.json"
-    decrypt_gdrive_sa "$sa_tmp" || return 1
-
+    # install rclone if needed
     local had_rclone="yes"
     local has_rc; has_rc=$(ssh_cmd "$relay" "which rclone 2>/dev/null" | tr -d '\r')
     if [[ -z "$has_rc" ]]; then
@@ -723,9 +720,14 @@ collect_to_node_then_gdrive() {
         log_info "Installing rclone on ${relay}..."
         ssh_cmd "$relay" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
     fi
-    scp_to "$relay" "$sa_tmp" "/tmp/.gdrive-sa.json"
-    ssh_cmd "$relay" "sudo chmod 600 /tmp/.gdrive-sa.json"
-    rm -f "$sa_tmp"
+
+    # decrypt SA key directly onto the node -- never touches local disk
+    echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null \
+        | ssh_cmd "$relay" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json" </dev/null
+    if ! ssh_cmd "$relay" "sudo test -s /tmp/.gdrive-sa.json" </dev/null 2>/dev/null; then
+        log_error "Failed to deploy Google Drive credentials to node"
+        return 1
+    fi
 
     # check if NFS staging has our results
     local use_nfs=false

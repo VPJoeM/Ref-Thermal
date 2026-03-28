@@ -435,11 +435,13 @@ collect_and_upload_gdrive_from_node() {
         log_info "Installing rclone on relay node..."
         remote_ssh "$relay_ip" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
     fi
-    local sa_tmp="/tmp/.gdrive-sa-local-$$.json"
-    decrypt_gdrive_sa "$sa_tmp" || return 1
-    remote_scp_to "$relay_ip" "$sa_tmp" "/tmp/.gdrive-sa.json"
-    remote_ssh "$relay_ip" "sudo chmod 600 /tmp/.gdrive-sa.json"
-    rm -f "$sa_tmp"
+    # decrypt SA key directly onto the node -- never touches local disk
+    echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null \
+        | remote_ssh "$relay_ip" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json" </dev/null
+    if ! remote_ssh "$relay_ip" "sudo test -s /tmp/.gdrive-sa.json" </dev/null 2>/dev/null; then
+        log_error "Failed to deploy Google Drive credentials to node"
+        return 1
+    fi
 
     local uploaded=0
 
@@ -661,12 +663,13 @@ collect_and_rollup() {
                 remote_ssh "$gdrive_node_ip" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
             fi
 
-            # push SA key (decrypt locally, scp to node)
-            local sa_tmp="/tmp/.gdrive-sa-local-$$.json"
-            decrypt_gdrive_sa "$sa_tmp" || return 1
-            remote_scp_to "$gdrive_node_ip" "$sa_tmp" "/tmp/.gdrive-sa.json"
-            remote_ssh "$gdrive_node_ip" "sudo chmod 600 /tmp/.gdrive-sa.json"
-            rm -f "$sa_tmp"
+            # decrypt SA key directly onto the node
+            echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null \
+                | remote_ssh "$gdrive_node_ip" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json" </dev/null
+            if ! remote_ssh "$gdrive_node_ip" "sudo test -s /tmp/.gdrive-sa.json" </dev/null 2>/dev/null; then
+                log_error "Failed to deploy Google Drive credentials to node"
+                break
+            fi
 
             # upload from node
             log_info "Uploading ${rname}.zip to Google Drive..."
