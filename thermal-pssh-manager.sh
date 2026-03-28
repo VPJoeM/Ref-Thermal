@@ -484,9 +484,9 @@ WRAPPER_EOF
                 fail_count=$((fail_count + 1)); continue
             fi
 
-            # poll the status file directly from the node via SSH
-            local st
-            st=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null | tr -d '\r')
+            # poll the status file -- SSH timeouts are not failures
+            local st=""
+            st=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null 2>/dev/null | tr -d '\r')
 
             case "$st" in
                 complete|done)
@@ -497,20 +497,16 @@ WRAPPER_EOF
                 failed)
                     node_state["$ip"]="failed"
                     fail_count=$((fail_count + 1))
-                    local reason
-                    reason=$(ssh_cmd "$ip" "grep -E 'ERROR:.*SRV|ERROR:.*RAC|Reason:' /tmp/thermal-pssh-output-*/. 2>/dev/null | tail -1 | head -c 70" </dev/null | tr -d '\r')
-                    echo -e "\033[2K\r  ${RED}✗${NC} $ip FAILED: ${reason:-unknown}"
+                    echo -e "\033[2K\r  ${RED}✗${NC} $ip FAILED"
                     ;;
-                tsr:*)
-                    run_count=$((run_count + 1))
-                    status_line+="  ${ip}: TSR ${st#tsr:}%"
-                    ;;
-                gpu-stress)  run_count=$((run_count + 1)); status_line+="  ${ip}: GPU stress" ;;
-                processing)  run_count=$((run_count + 1)); status_line+="  ${ip}: processing" ;;
-                cooldown)    run_count=$((run_count + 1)); status_line+="  ${ip}: cooldown" ;;
-                setup)       run_count=$((run_count + 1)); status_line+="  ${ip}: setup" ;;
-                starting)    run_count=$((run_count + 1)); status_line+="  ${ip}: starting" ;;
-                *)           run_count=$((run_count + 1)); status_line+="  ${ip}: running" ;;
+                tsr:*)      run_count=$((run_count + 1)); status_line+="  ${ip}: TSR ${st#tsr:}%" ;;
+                gpu-stress) run_count=$((run_count + 1)); status_line+="  ${ip}: GPU stress" ;;
+                processing) run_count=$((run_count + 1)); status_line+="  ${ip}: processing" ;;
+                cooldown)   run_count=$((run_count + 1)); status_line+="  ${ip}: cooldown" ;;
+                staging)    run_count=$((run_count + 1)); status_line+="  ${ip}: staging to NFS" ;;
+                setup)      run_count=$((run_count + 1)); status_line+="  ${ip}: setup" ;;
+                starting)   run_count=$((run_count + 1)); status_line+="  ${ip}: starting" ;;
+                *)          run_count=$((run_count + 1)); status_line+="  ${ip}: running" ;;
             esac
         done
 
@@ -532,19 +528,24 @@ WRAPPER_EOF
         log_warn "Some nodes had issues"
     fi
 
-    # show per-node status with failure reasons
+    # show per-node status -- always re-check the node directly
     local succeeded=0 node_failed=0
     for ip in "${NODE_IPS[@]}"; do
         local stdout_file="$outdir/$ip"
-        local stderr_file="$outdir/$ip"  # pssh puts stderr in same dir with -e
 
-        # check status file first, fall back to pssh output, fall back to node_state from monitor
-        local node_st="${node_state[$ip]:-unknown}"
-        if [[ "$node_st" != "done" && "$node_st" != "failed" ]]; then
-            node_st=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null | tr -d '\r')
+        # always re-poll the status file for final determination
+        local node_st
+        node_st=$(ssh_cmd "$ip" "cat /tmp/.thermal-status 2>/dev/null" </dev/null 2>/dev/null | tr -d '\r')
+
+        # also check if a result zip exists (most reliable indicator)
+        if [[ "$node_st" != "complete" && "$node_st" != "done" ]]; then
+            local has_zip
+            has_zip=$(ssh_cmd "$ip" "sudo ls /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1" </dev/null 2>/dev/null | tr -d '\r')
+            [[ -n "$has_zip" ]] && node_st="complete"
         fi
-        if [[ -z "$node_st" || "$node_st" == "unknown" ]]; then
-            # fall back to pssh output
+
+        # last resort: check pssh output
+        if [[ -z "$node_st" || "$node_st" == "unknown" || "$node_st" == "running" ]]; then
             if [[ -f "$stdout_file" ]] && grep -q "results are saved\|Script finalizing\|Results zip" "$stdout_file" 2>/dev/null; then
                 node_st="complete"
             fi
