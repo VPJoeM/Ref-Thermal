@@ -918,21 +918,26 @@ select_nodes() {
     echo ""
     printf "  ${BOLD}  %-12s %-10s %-18s %s${NC}\n" "NODE" "STATUS" "INTERNAL IP" "GPUs"
     echo -e "  ${DIM}  ──────────────────────────────────────────────${NC}"
-    while read -r name status roles age ver iip rest; do
-        [[ -z "$name" ]] && continue
-        local gc; gc=$(get_node_gpu_count "$name")
-        # retry once if GPU count is empty (can be transient)
-        [[ -z "$gc" || "$gc" == "0" ]] && gc=$(get_node_gpu_count "$name")
-        # include node if it has GPUs, or if status is Ready and we can't tell
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local nname nstatus nroles nage nver niip
+        nname=$(echo "$line" | awk '{print $1}')
+        nstatus=$(echo "$line" | awk '{print $2}')
+        nroles=$(echo "$line" | awk '{print $3}')
+        niip=$(echo "$line" | awk '{print $6}')
+        [[ -z "$nname" ]] && continue
+
+        local gc; gc=$(get_node_gpu_count "$nname")
+        [[ -z "$gc" || "$gc" == "0" ]] && gc=$(get_node_gpu_count "$nname")
+
         if [[ "${gc:-0}" -gt 0 ]]; then
-            NODE_IPS+=("$name"); IP_MAP_INTERNAL["$name"]="$iip"
-            local sc="${GREEN}"; [[ "$status" != "Ready" ]] && sc="${RED}"
-            printf "  ${sc}  %-12s %-10s %-18s %s${NC}\n" "$name" "$status" "$iip" "$gc"
-        elif [[ "$status" == "Ready" && "$roles" != *"control-plane"* ]]; then
-            # worker node with no GPU count reported -- might still have GPUs
+            NODE_IPS+=("$nname"); IP_MAP_INTERNAL["$nname"]="$niip"
+            local sc="${GREEN}"; [[ "$nstatus" != "Ready" ]] && sc="${RED}"
+            printf "  ${sc}  %-12s %-10s %-18s %s${NC}\n" "$nname" "$nstatus" "$niip" "$gc"
+        elif [[ "$nstatus" == "Ready" && "$nroles" != *"control-plane"* ]]; then
             gc=$DEFAULT_GPU_COUNT
-            NODE_IPS+=("$name"); IP_MAP_INTERNAL["$name"]="$iip"
-            printf "  ${YELLOW}  %-12s %-10s %-18s %s?${NC}\n" "$name" "$status" "$iip" "$gc"
+            NODE_IPS+=("$nname"); IP_MAP_INTERNAL["$nname"]="$niip"
+            printf "  ${YELLOW}  %-12s %-10s %-18s %s?${NC}\n" "$nname" "$nstatus" "$niip" "$gc"
         fi
     done <<< "$ni"
     [[ ${#NODE_IPS[@]} -eq 0 ]] && { log_error "No GPU nodes found"; return 1; }
