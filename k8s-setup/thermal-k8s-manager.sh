@@ -462,6 +462,12 @@ monitor_jobs() {
             [[ $failed -gt 0 ]] && log_warn "$failed job(s) failed"
             log_success "All jobs finished. $completed succeeded, $failed failed."
 
+            # kill any orphaned thermal processes on nodes (containers can leave host processes behind)
+            for nn in "${NODE_IPS[@]}"; do
+                node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null &
+            done
+            wait
+
             # save failed nodes for retry
             if [[ $failed -gt 0 ]]; then
                 local failed_names=()
