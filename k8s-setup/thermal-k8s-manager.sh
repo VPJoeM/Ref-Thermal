@@ -135,6 +135,27 @@ remote_ssh() {
     fi
 }
 
+# run a command on a worker node by hostname, relayed through the control plane
+node_exec() {
+    local node_name="$1"; shift
+    local iip="${IP_MAP_INTERNAL[$node_name]:-}"
+    [[ -z "$iip" ]] && { echo ""; return 1; }
+    remote_ssh "$CONTROL_PLANE_IP" \
+        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${DEFAULT_SSH_USER}@${iip} $*"
+}
+
+# copy a file FROM a worker node to local, relayed through control plane
+node_scp_from() {
+    local node_name="$1" remote_path="$2" local_path="$3"
+    local iip="${IP_MAP_INTERNAL[$node_name]:-}"
+    [[ -z "$iip" ]] && return 1
+    # stage on control plane, then pull to local
+    remote_ssh "$CONTROL_PLANE_IP" \
+        "scp -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip}:${remote_path} /tmp/.thermal-relay-file" 2>/dev/null
+    remote_scp_from "$CONTROL_PLANE_IP" "/tmp/.thermal-relay-file" "$local_path"
+    remote_ssh "$CONTROL_PLANE_IP" "rm -f /tmp/.thermal-relay-file" 2>/dev/null
+}
+
 remote_scp_from() {
     local pub_ip="$1" remote="$2" local_path="$3"
     local method="${NODE_CONNECT[$pub_ip]:-direct}"
@@ -318,31 +339,23 @@ distribute_image() {
 
     local failed=0
     for nn in "${node_names[@]}"; do
-        local iip="${IP_MAP_INTERNAL[$nn]:-}"
-        [[ -z "$iip" ]] && { echo -e "  ${RED}✗${NC} $nn -- no internal IP"; failed=$((failed+1)); continue; }
-
-        # check if image already exists on this node
         local existing
-        existing=$(remote_ssh "$CONTROL_PLANE_IP" \
-            "ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0'" 2>/dev/null | tr -d '\r')
+        existing=$(node_exec "$nn" "sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0" | tr -d '\r')
         if [[ "${existing:-0}" -gt 0 ]]; then
             echo -e "  ${GREEN}✓${NC} $nn -- already present"; continue
         fi
 
+        local iip="${IP_MAP_INTERNAL[$nn]:-}"
         echo -ne "  ${YELLOW}→${NC} $nn..."
-        # distribute via control plane → worker using internal IP
         remote_ssh "$CONTROL_PLANE_IP" \
             "scp -o StrictHostKeyChecking=no /tmp/thermal-image.tar ${DEFAULT_SSH_USER}@${iip}:/tmp/thermal-image.tar && \
              ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo ctr -n k8s.io images import /tmp/thermal-image.tar && rm -f /tmp/thermal-image.tar'" 2>/dev/null
         local v
-        v=$(remote_ssh "$CONTROL_PLANE_IP" \
-            "ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0'" 2>/dev/null | tr -d '\r')
+        v=$(node_exec "$nn" "sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0" | tr -d '\r')
         [[ "${v:-0}" -gt 0 ]] && echo -e " ${GREEN}✓${NC}" || { echo -e " ${RED}✗${NC}"; failed=$((failed+1)); }
     done
 
-    # cleanup tarball on control plane
     remote_ssh "$CONTROL_PLANE_IP" "rm -f /tmp/thermal-image.tar" 2>/dev/null
-
     [[ $failed -gt 0 ]] && { log_warn "$failed node(s) failed"; return 1; }
     log_success "Image on all nodes"
 }
@@ -387,15 +400,14 @@ launch_jobs() {
 
     # pre-flight: check for already-running thermal tests on nodes
     for nn in "${node_ips[@]}"; do
-        local pip="${NODE_PUBLIC_IPS[$nn]:-$CONTROL_PLANE_IP}"
         local running
-        running=$(remote_ssh "$pip" "pgrep -f 'thermal_diag\|dcgmproftester' 2>/dev/null | head -1" </dev/null 2>/dev/null | tr -d '\r')
+        running=$(node_exec "$nn" "pgrep -f 'thermal_diag\|dcgmproftester' 2>/dev/null | head -1" | tr -d '\r')
         if [[ -n "$running" ]]; then
             log_warn "${nn} has a thermal test already running (PID $running)"
             echo -ne "  Kill it and continue? (y/N): "
             read -r -n 1 ans </dev/tty; echo "" >/dev/tty
             if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
-                remote_ssh "$pip" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null
+                node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null
                 sleep 2
                 log_info "Killed old processes on $nn"
             else
@@ -577,16 +589,15 @@ collect_and_upload_gdrive_from_node() {
             [[ $? -eq 0 ]] && uploaded=1
         fi
     else
-        # SSH relay fallback: collect to relay, build rollup, upload
-        log_info "Collecting results via SSH relay..."
+        # SSH relay: collect each node's results through control plane
+        log_info "Collecting results via control plane relay..."
+        remote_ssh "$CONTROL_PLANE_IP" "mkdir -p /tmp/.thermal-rollup" </dev/null 2>/dev/null
         while read -r nn <&3; do
             [[ -z "$nn" ]] && continue
-            local pub_ip="${NODE_PUBLIC_IPS[$nn]:-$CONTROL_PLANE_IP}"
             echo -ne "  ${YELLOW}→${NC} ${nn}..."
 
             local rzip
-            rzip=$(remote_ssh "$pub_ip" \
-                "sudo bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1'" </dev/null | tr -d '\r')
+            rzip=$(node_exec "$nn" "sudo bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1'" | tr -d '\r')
             if [[ -z "$rzip" ]]; then
                 echo -e " ${RED}no results${NC}"
                 continue
@@ -598,13 +609,17 @@ collect_and_upload_gdrive_from_node() {
             [[ "$st" == "$zb" ]] && st="UNKNOWN"
             nzn="${nn}-${st}.zip"
 
-            remote_ssh "$pub_ip" "sudo cp '$rzip' /tmp/thermal-relay.zip && sudo chmod 644 /tmp/thermal-relay.zip" 2>/dev/null
-            remote_scp_from "$pub_ip" "/tmp/thermal-relay.zip" "/tmp/.thermal-rollup-$$/${nzn}"
-            remote_ssh "$pub_ip" "rm -f /tmp/thermal-relay.zip" 2>/dev/null
+            # stage file readable, pull to control plane staging area
+            local iip="${IP_MAP_INTERNAL[$nn]:-}"
+            node_exec "$nn" "sudo cp '$rzip' /tmp/thermal-relay.zip && sudo chmod 644 /tmp/thermal-relay.zip" </dev/null 2>/dev/null
+            remote_ssh "$CONTROL_PLANE_IP" \
+                "scp -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip}:/tmp/thermal-relay.zip /tmp/.thermal-rollup/${nzn}" </dev/null 2>/dev/null
+            node_exec "$nn" "rm -f /tmp/thermal-relay.zip" </dev/null 2>/dev/null
 
-            if [[ -f "/tmp/.thermal-rollup-$$/${nzn}" ]]; then
-                local zs; zs=$(du -h "/tmp/.thermal-rollup-$$/${nzn}" | cut -f1)
-                echo -e " ${GREEN}✓${NC} (${zs})"
+            local verify
+            verify=$(remote_ssh "$CONTROL_PLANE_IP" "ls -lh /tmp/.thermal-rollup/${nzn} 2>/dev/null" | awk '{print $5}' | tr -d '\r')
+            if [[ -n "$verify" ]]; then
+                echo -e " ${GREEN}✓${NC} (${verify})"
                 nfs_node_count=$((nfs_node_count + 1))
             else
                 echo -e " ${RED}failed${NC}"
@@ -612,13 +627,13 @@ collect_and_upload_gdrive_from_node() {
         done 3<<< "$jnodes"
 
         if [[ $nfs_node_count -gt 0 ]]; then
-            mkdir -p "/tmp/.thermal-rollup-$$"
             log_info "Creating rollup (${nfs_node_count} nodes)..."
-            (cd /tmp/.thermal-rollup-$$ && zip -r "/tmp/${rname}.zip" *.zip >/dev/null 2>&1)
-            local rollup_sz; rollup_sz=$(du -h "/tmp/${rname}.zip" | cut -f1)
+            remote_ssh "$CONTROL_PLANE_IP" \
+                "cd /tmp/.thermal-rollup && sudo zip -r /tmp/${rname}.zip *.zip >/dev/null 2>&1" </dev/null
+            local rollup_sz
+            rollup_sz=$(remote_ssh "$CONTROL_PLANE_IP" "ls -lh /tmp/${rname}.zip 2>/dev/null" | awk '{print $5}' | tr -d '\r')
 
             log_info "Uploading rollup to Google Drive (${rollup_sz})..."
-            remote_scp_to "$relay_ip" "/tmp/${rname}.zip" "/tmp/${rname}.zip"
             remote_ssh "$relay_ip" \
                 "sudo rclone copyto '/tmp/${rname}.zip' ':drive:${GDRIVE_FOLDER}/${rname}.zip' \
                  --drive-service-account-file /tmp/.gdrive-sa.json \
@@ -626,8 +641,7 @@ collect_and_upload_gdrive_from_node() {
                  --drive-scope drive 2>&1" >/dev/null 2>&1
             [[ $? -eq 0 ]] && uploaded=1
 
-            remote_ssh "$relay_ip" "rm -f '/tmp/${rname}.zip'" 2>/dev/null
-            rm -rf "/tmp/.thermal-rollup-$$" "/tmp/${rname}.zip"
+            remote_ssh "$CONTROL_PLANE_IP" "rm -rf /tmp/.thermal-rollup /tmp/${rname}.zip" 2>/dev/null
         fi
     fi
 
@@ -635,10 +649,9 @@ collect_and_upload_gdrive_from_node() {
     remote_ssh "$relay_ip" "sudo rm -f /tmp/.gdrive-sa.json" 2>/dev/null
     [[ "$had_rclone" == "no" ]] && remote_ssh "$relay_ip" "sudo rm -f /usr/bin/rclone /usr/local/bin/rclone" 2>/dev/null
 
-    # cleanup local node results only
+    # cleanup node results (not NFS)
     for nn in "${NODE_IPS[@]}"; do
-        local pip="${NODE_PUBLIC_IPS[$nn]:-}"
-        [[ -n "$pip" ]] && remote_ssh "$pip" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/*" </dev/null 2>/dev/null &
+        node_exec "$nn" "sudo rm -rf /root/TDAS/dcgmprof-* /root/Reports/thermal-results/*" </dev/null 2>/dev/null &
     done
     wait
 
@@ -978,13 +991,26 @@ run_diagnostics_menu() {
     if ! check_kubectl; then return 1; fi
     kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
 
+    # pre-install rclone on control plane if gdrive output (do it now, not after 30-min test)
+    if [[ "$OUTPUT_MODE" == "gdrive" ]]; then
+        local has_rc; has_rc=$(remote_ssh "$CONTROL_PLANE_IP" "which rclone 2>/dev/null" 2>/dev/null | tr -d '\r')
+        if [[ -z "$has_rc" ]]; then
+            log_info "Pre-installing rclone on control plane..."
+            remote_ssh "$CONTROL_PLANE_IP" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
+        fi
+        # deploy SA key now too
+        local _sa_json
+        _sa_json=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
+        echo "$_sa_json" | remote_ssh "$CONTROL_PLANE_IP" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json"
+        unset _sa_json
+        log_success "Google Drive upload ready"
+    fi
+
     log_info "Checking container image..."
     local needs=()
     for n in "${NODE_IPS[@]}"; do
-        local iip="${IP_MAP_INTERNAL[$n]:-}"
         local hi
-        hi=$(remote_ssh "$CONTROL_PLANE_IP" \
-            "ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0'" 2>/dev/null | tr -d '\r')
+        hi=$(node_exec "$n" "sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0" | tr -d '\r')
         [[ "${hi:-0}" == "0" ]] && needs+=("$n") || echo -e "  ${GREEN}✓${NC} $n"
     done
     if [[ ${#needs[@]} -gt 0 ]]; then
