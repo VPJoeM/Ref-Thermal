@@ -69,6 +69,12 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
 
 save_history() {
+    # build node-to-IP mapping string: "g329:10.15.35.81:147.185.41.203,g330:10.15.35.89:147.185.41.204"
+    local pub_map="" int_map=""
+    for n in "${NODE_IPS[@]}"; do
+        [[ -n "${NODE_PUBLIC_IPS[$n]:-}" ]] && pub_map+="${n}:${NODE_PUBLIC_IPS[$n]},"
+        [[ -n "${IP_MAP_INTERNAL[$n]:-}" ]] && int_map+="${n}:${IP_MAP_INTERNAL[$n]},"
+    done
     cat > "$HISTORY_FILE" << EOF
 HIST_NODE_IPS="${NODE_IPS[*]}"
 HIST_OUTPUT_MODE="$OUTPUT_MODE"
@@ -76,6 +82,8 @@ HIST_EXECUTION_MODE="$EXECUTION_MODE"
 HIST_CONTROL_PLANE_IP="${CONTROL_PLANE_IP:-}"
 HIST_SSH_USER="$DEFAULT_SSH_USER"
 HIST_SSH_KEY="$DEFAULT_SSH_KEY"
+HIST_PUB_MAP="${pub_map%,}"
+HIST_INT_MAP="${int_map%,}"
 HIST_TIMESTAMP="$(date '+%Y-%m-%d %H:%M')"
 EOF
 }
@@ -89,6 +97,23 @@ load_history() {
     CONTROL_PLANE_IP="${HIST_CONTROL_PLANE_IP:-}"
     DEFAULT_SSH_USER="$HIST_SSH_USER"
     DEFAULT_SSH_KEY="$HIST_SSH_KEY"
+    DC_NAME="sea1"; ALTITUDE=220
+
+    # restore IP mappings
+    IFS=',' read -ra _pairs <<< "$HIST_PUB_MAP"
+    for p in "${_pairs[@]}"; do
+        [[ -z "$p" ]] && continue
+        local nn="${p%%:*}" ip="${p#*:}"
+        NODE_PUBLIC_IPS["$nn"]="$ip"
+        NODE_CONNECT["$ip"]="direct"
+        IP_MAP_HOSTNAME["$ip"]="$nn"
+    done
+    IFS=',' read -ra _pairs <<< "$HIST_INT_MAP"
+    for p in "${_pairs[@]}"; do
+        [[ -z "$p" ]] && continue
+        local nn="${p%%:*}" ip="${p#*:}"
+        IP_MAP_INTERNAL["$nn"]="$ip"
+    done
     return 0
 }
 
@@ -1174,32 +1199,16 @@ rerun_last() {
     echo ""
     echo -e "${CYAN}${BOLD}Rerunning last configuration:${NC}"
     echo -e "  ${CYAN}Nodes:${NC}     ${#NODE_IPS[@]} (${NODE_IPS[*]})"
-    echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
     echo -e "  ${CYAN}Mode:${NC}      ${EXECUTION_MODE}"
+    [[ "$EXECUTION_MODE" == "remote" ]] && echo -e "  ${CYAN}Control:${NC}  ${CONTROL_PLANE_IP}"
+    echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
+    echo -e "  ${CYAN}Key:${NC}       $(basename "$DEFAULT_SSH_KEY")"
     echo -e "  ${CYAN}Last run:${NC}  ${HIST_TIMESTAMP}"
     echo ""
     read -p "  Go? (Y/n): " rc
     [[ "$rc" =~ ^[Nn]$ ]] && return 0
     echo -e "\n${GREEN}${BOLD}>>> LAUNCHING -- no more prompts, sit back <<<${NC}\n"
-    DC_NAME="sea1"; ALTITUDE=220
     if ! check_kubectl; then return 1; fi
-
-    # repopulate arrays for local mode
-    if [[ "$EXECUTION_MODE" == "local" ]]; then
-        local ni; ni=$(kubectl_exec get nodes -o wide --no-headers 2>/dev/null)
-        while read -r name status roles age ver iip rest; do
-            for n in "${NODE_IPS[@]}"; do
-                if [[ "$name" == "$n" ]]; then
-                    IP_MAP_INTERNAL["$n"]="$iip"
-                    NODE_PUBLIC_IPS["$n"]="$iip"
-                    NODE_CONNECT["$iip"]="direct"
-                    IP_MAP_HOSTNAME["$iip"]="$n"
-                fi
-            done
-        done <<< "$ni"
-        CONTROL_PLANE_IP="127.0.0.1"
-    fi
-
     kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
     launch_jobs "${NODE_IPS[@]}"
 }
