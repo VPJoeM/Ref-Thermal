@@ -911,7 +911,10 @@ select_nodes() {
     fi
     if ! check_kubectl; then return 1; fi
     log_info "Querying cluster for GPU nodes..."
-    local ni; ni=$(kubectl_exec get nodes -o wide --no-headers 2>/dev/null)
+
+    # single query for all nodes with GPU counts
+    local ni
+    ni=$(kubectl_exec get nodes -o "custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type,IP:.status.addresses[0].address,GPU:.status.capacity.nvidia\.com/gpu" --no-headers 2>/dev/null)
     [[ -z "$ni" ]] && { log_error "No nodes found"; return 1; }
 
     NODE_IPS=()
@@ -920,24 +923,17 @@ select_nodes() {
     echo -e "  ${DIM}  ──────────────────────────────────────────────${NC}"
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        local nname nstatus nroles nage nver niip
+        local nname nstatus niip ngpu
         nname=$(echo "$line" | awk '{print $1}')
         nstatus=$(echo "$line" | awk '{print $2}')
-        nroles=$(echo "$line" | awk '{print $3}')
-        niip=$(echo "$line" | awk '{print $6}')
-        [[ -z "$nname" ]] && continue
+        niip=$(echo "$line" | awk '{print $3}')
+        ngpu=$(echo "$line" | awk '{print $4}')
+        [[ -z "$nname" || "$ngpu" == "<none>" ]] && ngpu="0"
 
-        local gc; gc=$(get_node_gpu_count "$nname")
-        [[ -z "$gc" || "$gc" == "0" ]] && gc=$(get_node_gpu_count "$nname")
-
-        if [[ "${gc:-0}" -gt 0 ]]; then
+        if [[ "${ngpu:-0}" -gt 0 ]]; then
             NODE_IPS+=("$nname"); IP_MAP_INTERNAL["$nname"]="$niip"
             local sc="${GREEN}"; [[ "$nstatus" != "Ready" ]] && sc="${RED}"
-            printf "  ${sc}  %-12s %-10s %-18s %s${NC}\n" "$nname" "$nstatus" "$niip" "$gc"
-        elif [[ "$nstatus" == "Ready" && "$nroles" != *"control-plane"* ]]; then
-            gc=$DEFAULT_GPU_COUNT
-            NODE_IPS+=("$nname"); IP_MAP_INTERNAL["$nname"]="$niip"
-            printf "  ${YELLOW}  %-12s %-10s %-18s %s?${NC}\n" "$nname" "$nstatus" "$niip" "$gc"
+            printf "  ${sc}  %-12s %-10s %-18s %s${NC}\n" "$nname" "$nstatus" "$niip" "$ngpu"
         fi
     done <<< "$ni"
     [[ ${#NODE_IPS[@]} -eq 0 ]] && { log_error "No GPU nodes found"; return 1; }
@@ -949,26 +945,21 @@ select_nodes() {
             NODE_IPS=($(echo "$sel" | tr ',' ' '))
         fi
     fi
-    if [[ "$EXECUTION_MODE" == "remote" ]]; then
-        echo ""; echo -e "  ${CYAN}${BOLD}Public IPs for SSH access${NC} ${DIM}(needed to collect results)${NC}"
-        for n in "${NODE_IPS[@]}"; do
-            [[ -z "${NODE_PUBLIC_IPS[$n]:-}" ]] && { read -p "  Public IP for ${n}: " pip; NODE_PUBLIC_IPS["$n"]="$pip"; }
-        done
 
-        # test connectivity to each node, auto-detect proxy needs
-        test_node_connectivity || return 1
-    else
-        # local mode: use internal IPs for SSH to nodes
-        for n in "${NODE_IPS[@]}"; do
-            local iip="${IP_MAP_INTERNAL[$n]:-}"
-            if [[ -n "$iip" ]]; then
-                NODE_PUBLIC_IPS["$n"]="$iip"
-                NODE_CONNECT["$iip"]="direct"
-                IP_MAP_HOSTNAME["$iip"]="$n"
-            fi
-        done
-        CONTROL_PLANE_IP="127.0.0.1"
-    fi
+    # map IPs: in remote mode route through control plane, in local mode use internal IPs directly
+    for n in "${NODE_IPS[@]}"; do
+        local iip="${IP_MAP_INTERNAL[$n]:-}"
+        if [[ "$EXECUTION_MODE" == "remote" ]]; then
+            NODE_PUBLIC_IPS["$n"]="$CONTROL_PLANE_IP"
+            NODE_CONNECT["$CONTROL_PLANE_IP"]="${NODE_CONNECT[$CONTROL_PLANE_IP]:-direct}"
+            IP_MAP_HOSTNAME["$CONTROL_PLANE_IP"]="${IP_MAP_HOSTNAME[$CONTROL_PLANE_IP]:-$n}"
+        else
+            [[ -n "$iip" ]] && NODE_PUBLIC_IPS["$n"]="$iip"
+            [[ -n "$iip" ]] && NODE_CONNECT["$iip"]="direct"
+            [[ -n "$iip" ]] && IP_MAP_HOSTNAME["$iip"]="$n"
+        fi
+    done
+    [[ "$EXECUTION_MODE" == "local" ]] && CONTROL_PLANE_IP="127.0.0.1"
     return 0
 }
 
