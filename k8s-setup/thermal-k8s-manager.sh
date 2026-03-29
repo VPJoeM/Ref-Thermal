@@ -201,22 +201,7 @@ test_node_connectivity() {
 
 detect_execution_mode() {
     [[ -n "$EXECUTION_MODE" ]] && return 0
-    if command -v kubectl &>/dev/null && kubectl cluster-info &>/dev/null 2>&1; then
-        EXECUTION_MODE="local"; log_success "Running locally on cluster node"; return 0
-    fi
-    if command -v kubectl &>/dev/null && sudo kubectl cluster-info &>/dev/null 2>&1; then
-        EXECUTION_MODE="local"; log_success "Running locally (kubectl via sudo)"; return 0
-    fi
-    echo -e "\n${CYAN}${BOLD}Connection Method${NC}"
-    echo -e "  ${GREEN}1)${NC} ${BOLD}Via SSH (remote)${NC} ${DIM}(route kubectl to a control node)${NC}"
-    echo -e "  ${GREEN}2)${NC} ${BOLD}Kubeconfig file${NC} ${DIM}(kubectl runs locally)${NC}"
-    echo ""
-    read -p "  Choice [1-2]: " mc
-    case "$mc" in
-        1) EXECUTION_MODE="remote";  ;;
-        2) EXECUTION_MODE="kubeconfig"; prompt_for_kubeconfig || exit 1 ;;
-        *) log_error "Invalid"; exit 1 ;;
-    esac
+    EXECUTION_MODE="remote"
 }
 
 prompt_for_kubeconfig() {
@@ -321,30 +306,43 @@ build_image() {
 }
 
 distribute_image() {
-    local nodes=("$@")
-    echo -e "\n${CYAN}Distributing image to ${#nodes[@]} node(s)...${NC}"
+    local node_names=("$@")
+    echo -e "\n${CYAN}Distributing image to ${#node_names[@]} node(s)...${NC}"
+
+    # build on control plane first
+    build_image || return 1
+
+    # save image as tarball on control plane
+    log_info "Saving image for distribution..."
+    remote_ssh "$CONTROL_PLANE_IP" "sudo docker save '${IMAGE_FULL}' > /tmp/thermal-image.tar" 2>/dev/null
+
     local failed=0
-    for pub_ip in "${nodes[@]}"; do
-        local hn="${IP_MAP_HOSTNAME[$pub_ip]:-$pub_ip}"
+    for nn in "${node_names[@]}"; do
+        local iip="${IP_MAP_INTERNAL[$nn]:-}"
+        [[ -z "$iip" ]] && { echo -e "  ${RED}✗${NC} $nn -- no internal IP"; failed=$((failed+1)); continue; }
+
+        # check if image already exists on this node
         local existing
-        existing=$(remote_ssh "$pub_ip" "sudo crictl images 2>/dev/null | grep -c '$IMAGE_NAME' || echo 0" | tr -d '\r')
+        existing=$(remote_ssh "$CONTROL_PLANE_IP" \
+            "ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0'" 2>/dev/null | tr -d '\r')
         if [[ "${existing:-0}" -gt 0 ]]; then
-            echo -e "  ${GREEN}✓${NC} $hn -- already present"; continue
+            echo -e "  ${GREEN}✓${NC} $nn -- already present"; continue
         fi
-        echo -e "  ${YELLOW}→${NC} Building on $hn..."
-        cp "$THERMAL_SCRIPT" "${DOCKERFILE_DIR}/thermal-diagnostics-2.6.2-vp.sh" 2>/dev/null
-        remote_ssh "$pub_ip" "mkdir -p /tmp/thermal-build"
-        for f in "${DOCKERFILE_DIR}/Dockerfile" "${DOCKERFILE_DIR}/entrypoint.sh" "${DOCKERFILE_DIR}/thermal-diagnostics-2.6.2-vp.sh"; do
-            remote_scp_to "$pub_ip" "$f" "/tmp/thermal-build/$(basename $f)"
-        done
-        rm -f "${DOCKERFILE_DIR}/thermal-diagnostics-2.6.2-vp.sh" 2>/dev/null
-        remote_ssh "$pub_ip" "cd /tmp/thermal-build && sudo docker build -t '${IMAGE_FULL}' . 2>&1 | tail -3 && \
-             sudo docker save '${IMAGE_FULL}' | sudo ctr -n k8s.io images import - && \
-             rm -rf /tmp/thermal-build"
+
+        echo -ne "  ${YELLOW}→${NC} $nn..."
+        # distribute via control plane → worker using internal IP
+        remote_ssh "$CONTROL_PLANE_IP" \
+            "scp -o StrictHostKeyChecking=no /tmp/thermal-image.tar ${DEFAULT_SSH_USER}@${iip}:/tmp/thermal-image.tar && \
+             ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo ctr -n k8s.io images import /tmp/thermal-image.tar && rm -f /tmp/thermal-image.tar'" 2>/dev/null
         local v
-        v=$(remote_ssh "$pub_ip" "sudo crictl images 2>/dev/null | grep -c '$IMAGE_NAME' || echo 0" | tr -d '\r')
-        [[ "${v:-0}" -gt 0 ]] && echo -e "  ${GREEN}✓${NC} $hn" || { echo -e "  ${RED}✗${NC} $hn"; failed=$((failed+1)); }
+        v=$(remote_ssh "$CONTROL_PLANE_IP" \
+            "ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0'" 2>/dev/null | tr -d '\r')
+        [[ "${v:-0}" -gt 0 ]] && echo -e " ${GREEN}✓${NC}" || { echo -e " ${RED}✗${NC}"; failed=$((failed+1)); }
     done
+
+    # cleanup tarball on control plane
+    remote_ssh "$CONTROL_PLANE_IP" "rm -f /tmp/thermal-image.tar" 2>/dev/null
+
     [[ $failed -gt 0 ]] && { log_warn "$failed node(s) failed"; return 1; }
     log_success "Image on all nodes"
 }
@@ -840,79 +838,43 @@ collect_and_rollup() {
 
 # ─── Interactive Menu ─────────────────────────────────────────
 
-select_nodes() {
-    detect_execution_mode
-    if [[ "$EXECUTION_MODE" == "remote" && -z "$CONTROL_PLANE_IP" ]]; then
-        echo -e "${CYAN}${BOLD}[1/2] Cluster Access${NC}"
+_pick_ssh_key() {
+    local keys=() key_labels=()
+    while IFS= read -r kf; do
+        [[ "$kf" == *.pub || "$kf" == *.crt || "$kf" == *known_hosts* || "$kf" == *authorized_keys* || "$kf" == *config* ]] && continue
+        [[ ! -f "$kf" ]] && continue
+        if head -1 "$kf" 2>/dev/null | grep -qE "PRIVATE KEY|OPENSSH"; then
+            keys+=("$kf")
+            local bn; bn=$(basename "$kf")
+            local ktype; ktype=$(ssh-keygen -l -f "$kf" 2>/dev/null | awk '{print $4}' | tr -d '()')
+            key_labels+=("${bn} ${DIM}(${ktype:-unknown})${NC}")
+        fi
+    done < <(find ~/.ssh -maxdepth 1 -type f 2>/dev/null | sort)
 
-        read -p "  SSH username [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
-
-        # scan ~/.ssh for private keys and present a picker
-        local keys=() key_labels=()
-        while IFS= read -r kf; do
-            [[ "$kf" == *.pub || "$kf" == *.crt || "$kf" == *known_hosts* || "$kf" == *authorized_keys* || "$kf" == *config* ]] && continue
-            [[ ! -f "$kf" ]] && continue
-            if head -1 "$kf" 2>/dev/null | grep -qE "PRIVATE KEY|OPENSSH"; then
-                keys+=("$kf")
-                local bn; bn=$(basename "$kf")
-                local ktype; ktype=$(ssh-keygen -l -f "$kf" 2>/dev/null | awk '{print $4}' | tr -d '()')
-                key_labels+=("${bn} ${DIM}(${ktype:-unknown})${NC}")
-            fi
-        done < <(find ~/.ssh -maxdepth 1 -type f 2>/dev/null | sort)
-
-        if [[ ${#keys[@]} -gt 0 ]]; then
-            echo ""
-            echo -e "  ${CYAN}Available SSH keys:${NC}"
-            for i in "${!keys[@]}"; do
-                echo -e "    ${GREEN}$((i+1)))${NC} ${key_labels[$i]}"
-            done
-            echo -e "    ${GREEN}$((${#keys[@]}+1)))${NC} Enter path manually"
-            echo ""
-            read -p "  Select key [1-$((${#keys[@]}+1))]: " key_choice
-            if [[ "$key_choice" =~ ^[0-9]+$ ]] && [[ "$key_choice" -ge 1 ]] && [[ "$key_choice" -le "${#keys[@]}" ]]; then
-                DEFAULT_SSH_KEY="${keys[$((key_choice-1))]}"
-            else
-                read -e -p "  Key path: " DEFAULT_SSH_KEY
-                DEFAULT_SSH_KEY="${DEFAULT_SSH_KEY/#\~/$HOME}"
-            fi
+    if [[ ${#keys[@]} -gt 0 ]]; then
+        echo -e "  ${CYAN}SSH keys:${NC}"
+        for i in "${!keys[@]}"; do
+            echo -e "    ${GREEN}$((i+1)))${NC} ${key_labels[$i]}"
+        done
+        echo -e "    ${GREEN}$((${#keys[@]}+1)))${NC} Enter path manually"
+        echo ""
+        read -p "  Select key: " key_choice
+        if [[ "$key_choice" =~ ^[0-9]+$ ]] && [[ "$key_choice" -ge 1 ]] && [[ "$key_choice" -le "${#keys[@]}" ]]; then
+            DEFAULT_SSH_KEY="${keys[$((key_choice-1))]}"
         else
-            read -e -p "  SSH key path [$DEFAULT_SSH_KEY]: " sk
-            DEFAULT_SSH_KEY="${sk:-$DEFAULT_SSH_KEY}"
+            read -e -p "  Key path: " DEFAULT_SSH_KEY
             DEFAULT_SSH_KEY="${DEFAULT_SSH_KEY/#\~/$HOME}"
         fi
-        echo -e "  ${GREEN}Using: $(basename "$DEFAULT_SSH_KEY")${NC}"
-        [[ ! -f "$DEFAULT_SSH_KEY" ]] && { log_error "Key not found: $DEFAULT_SSH_KEY"; return 1; }
-
-        echo -e "${DIM}  Control plane IP${NC}"
-        read -p "  IP: " CONTROL_PLANE_IP
-
-        # test connectivity, auto-detect proxy if needed
-        echo -ne "  Testing ${CONTROL_PLANE_IP}: "
-        if remote_ssh "$CONTROL_PLANE_IP" "echo ok" &>/dev/null 2>&1; then
-            NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
-            echo -e "${GREEN}direct OK${NC}"
-        else
-            echo -e "${YELLOW}direct failed${NC}"
-            echo -e "  ${DIM}May need jump host (${JUMP_HOST})${NC}"
-            read -p "  Private IP for control plane (or 'skip'): " cp_priv
-            if [[ "$cp_priv" != "skip" ]]; then
-                echo -ne "  Testing via proxy: "
-                if ssh $SSH_OPTS -o ProxyCommand="ssh $SSH_OPTS -i $DEFAULT_SSH_KEY -W %h:%p ${DEFAULT_SSH_USER}@${JUMP_HOST}" \
-                    "${DEFAULT_SSH_USER}@${cp_priv}" "echo ok" &>/dev/null 2>&1; then
-                    NODE_CONNECT["$CONTROL_PLANE_IP"]="proxy:${cp_priv}"
-                    echo -e "${GREEN}OK via ${JUMP_HOST}${NC}"
-                else
-                    echo -e "${RED}FAILED${NC}"
-                    log_error "Cannot reach control plane"
-                    return 1
-                fi
-            fi
-        fi
+    else
+        read -e -p "  SSH key path: " DEFAULT_SSH_KEY
+        DEFAULT_SSH_KEY="${DEFAULT_SSH_KEY/#\~/$HOME}"
     fi
-    if ! check_kubectl; then return 1; fi
-    log_info "Querying cluster for GPU nodes..."
+    [[ ! -f "$DEFAULT_SSH_KEY" ]] && { log_error "Key not found: $DEFAULT_SSH_KEY"; return 1; }
+    echo -e "  ${GREEN}Using: $(basename "$DEFAULT_SSH_KEY")${NC}"
+}
 
-    # single query for all nodes with GPU counts
+_discover_gpu_nodes() {
+    log_info "Querying cluster for GPU nodes..."
     local ni
     ni=$(kubectl_exec get nodes -o "custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type,IP:.status.addresses[0].address,GPU:.status.capacity.nvidia\.com/gpu" --no-headers 2>/dev/null)
     [[ -z "$ni" ]] && { log_error "No nodes found"; return 1; }
@@ -928,16 +890,19 @@ select_nodes() {
         nstatus=$(echo "$line" | awk '{print $2}')
         niip=$(echo "$line" | awk '{print $3}')
         ngpu=$(echo "$line" | awk '{print $4}')
-        [[ -z "$nname" || "$ngpu" == "<none>" ]] && ngpu="0"
+        [[ "$ngpu" == "<none>" ]] && ngpu="0"
 
         if [[ "${ngpu:-0}" -gt 0 ]]; then
-            NODE_IPS+=("$nname"); IP_MAP_INTERNAL["$nname"]="$niip"
+            NODE_IPS+=("$nname")
+            IP_MAP_INTERNAL["$nname"]="$niip"
+            NODE_PUBLIC_IPS["$nname"]="$CONTROL_PLANE_IP"
             local sc="${GREEN}"; [[ "$nstatus" != "Ready" ]] && sc="${RED}"
             printf "  ${sc}  %-12s %-10s %-18s %s${NC}\n" "$nname" "$nstatus" "$niip" "$ngpu"
         fi
     done <<< "$ni"
     [[ ${#NODE_IPS[@]} -eq 0 ]] && { log_error "No GPU nodes found"; return 1; }
-    echo ""; echo -e "  ${GREEN}Found ${#NODE_IPS[@]} GPU node(s)${NC}"
+    echo ""
+    echo -e "  ${GREEN}Found ${#NODE_IPS[@]} GPU node(s)${NC}"
     if [[ ${#NODE_IPS[@]} -gt 1 ]]; then
         read -p "  Run on all ${#NODE_IPS[@]}? (Y/n): " ac
         if [[ "$ac" =~ ^[Nn]$ ]]; then
@@ -945,94 +910,67 @@ select_nodes() {
             NODE_IPS=($(echo "$sel" | tr ',' ' '))
         fi
     fi
-
-    # map IPs: in remote mode route through control plane, in local mode use internal IPs directly
-    for n in "${NODE_IPS[@]}"; do
-        local iip="${IP_MAP_INTERNAL[$n]:-}"
-        if [[ "$EXECUTION_MODE" == "remote" ]]; then
-            NODE_PUBLIC_IPS["$n"]="$CONTROL_PLANE_IP"
-            NODE_CONNECT["$CONTROL_PLANE_IP"]="${NODE_CONNECT[$CONTROL_PLANE_IP]:-direct}"
-            IP_MAP_HOSTNAME["$CONTROL_PLANE_IP"]="${IP_MAP_HOSTNAME[$CONTROL_PLANE_IP]:-$n}"
-        else
-            [[ -n "$iip" ]] && NODE_PUBLIC_IPS["$n"]="$iip"
-            [[ -n "$iip" ]] && NODE_CONNECT["$iip"]="direct"
-            [[ -n "$iip" ]] && IP_MAP_HOSTNAME["$iip"]="$n"
-        fi
-    done
-    [[ "$EXECUTION_MODE" == "local" ]] && CONTROL_PLANE_IP="127.0.0.1"
-    return 0
-}
-
-select_dc_name() {
-    DC_NAME="sea1"
-    ALTITUDE=220
-}
-
-select_output_mode() {
-    echo -e "\n${CYAN}${BOLD}[2/2] Output Destination${NC}"
-    echo -e "  ${GREEN}1)${NC} Google Drive ${DIM}(default)${NC}  ${GREEN}2)${NC} Node ${DIM}(scp to one node)${NC}  ${GREEN}3)${NC} Local ${DIM}(stay on each node)${NC}  ${GREEN}4)${NC} NFS  ${GREEN}5)${NC} FTP"
-    read -p "  Choice [1-5] (default: 1): " oc
-    oc="${oc:-1}"
-    case "$oc" in
-        1) OUTPUT_MODE="gdrive"
-           read -p "  Drive folder [${GDRIVE_FOLDER}]: " gf
-           GDRIVE_FOLDER="${gf:-$GDRIVE_FOLDER}" ;;
-        2) OUTPUT_MODE="node"
-           echo -e "  ${DIM}Enter hostname (e.g. g329) or public IP${NC}"
-           read -p "  Collection node: " COLLECT_NODE; COLLECT_USER="root"
-           COLLECT_PATH="/root/Reports/thermal-results"; export COLLECT_NODE COLLECT_USER COLLECT_PATH ;;
-        3) OUTPUT_MODE="local" ;;
-        4) OUTPUT_MODE="nfs"; read -p "  NFS server: " NFS_SERVER; read -p "  NFS path: " NFS_PATH
-           export NFS_SERVER NFS_PATH ;;
-        5) OUTPUT_MODE="ftp"; read -p "  FTP host: " FTP_HOST; read -p "  FTP user: " FTP_USER
-           read -sp "  FTP password: " FTP_PASS; echo ""; FTP_PATH="/thermal-results"
-           export FTP_HOST FTP_USER FTP_PASS FTP_PATH ;;
-        *) log_error "Invalid"; return 1 ;;
-    esac
 }
 
 run_diagnostics_menu() {
     echo ""
     echo -e "${BLUE}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}${BOLD}║          Thermal Diagnostics Setup Wizard                ║${NC}"
+    echo -e "${BLUE}${BOLD}║          Thermal Diagnostics - K8s Wizard                ║${NC}"
     echo -e "${BLUE}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
-    echo -e "${DIM}  2 questions, then it runs hands-off across the entire fleet.${NC}"
+    echo -e "${DIM}  3 inputs, then it runs hands-off across the entire fleet.${NC}"
     echo ""
-    NODE_IPS=(); OUTPUT_MODE=""
-    DC_NAME="sea1"; ALTITUDE=220
-    select_nodes || return 1
-    select_output_mode || return 1
 
+    NODE_IPS=(); OUTPUT_MODE="gdrive"
+    DC_NAME="sea1"; ALTITUDE=220
+    EXECUTION_MODE="remote"
+
+    # [1/3] SSH key
+    echo -e "${CYAN}${BOLD}[1/3] SSH Key${NC}"
+    _pick_ssh_key || return 1
+    read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
+
+    # [2/3] Control plane
+    echo ""
+    echo -e "${CYAN}${BOLD}[2/3] Control Plane IP${NC}"
+    read -p "  IP: " CONTROL_PLANE_IP
+    echo -ne "  Testing: "
+    if remote_ssh "$CONTROL_PLANE_IP" "echo ok" &>/dev/null 2>&1; then
+        NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${RED}FAILED${NC}"
+        log_error "Cannot SSH to $CONTROL_PLANE_IP with $(basename "$DEFAULT_SSH_KEY")"
+        return 1
+    fi
+
+    # auto-discover nodes
+    if ! check_kubectl; then return 1; fi
+    _discover_gpu_nodes || return 1
+
+    # [3/3] Output
+    echo ""
+    echo -e "${CYAN}${BOLD}[3/3] Output${NC}"
+    echo -e "  ${GREEN}1)${NC} Google Drive ${DIM}(default)${NC}  ${GREEN}2)${NC} Local ${DIM}(stay on each node)${NC}"
+    read -p "  Choice [1-2] (default: 1): " oc
+    case "${oc:-1}" in
+        1) OUTPUT_MODE="gdrive" ;;
+        2) OUTPUT_MODE="local" ;;
+    esac
+
+    # summary
     echo ""
     echo -e "${BLUE}${BOLD}══════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}  SUMMARY${NC}"
     echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
     echo -e "  ${CYAN}Nodes:${NC}     ${#NODE_IPS[@]} (${NODE_IPS[*]})"
+    echo -e "  ${CYAN}Control:${NC}   ${CONTROL_PLANE_IP}"
+    echo -e "  ${CYAN}Key:${NC}       $(basename "$DEFAULT_SSH_KEY")"
     echo -e "  ${CYAN}Site:${NC}      ${DC_NAME} (${ALTITUDE} ft)"
     echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
-    case "${OUTPUT_MODE}" in
-        node) echo -e "  ${CYAN}Collect:${NC}   ${COLLECT_NODE}" ;; ftp) echo -e "  ${CYAN}FTP:${NC}       ${FTP_HOST}" ;; esac
     echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
     echo ""
     read -p "  Ready to go? (Y/n): " lc
     [[ "$lc" =~ ^[Nn]$ ]] && { echo "Cancelled."; return 0; }
-
-    # preflight: verify Google Drive credentials if gdrive output selected
-    if [[ "$OUTPUT_MODE" == "gdrive" ]]; then
-        echo -e "\n  ${CYAN}Testing Google Drive credentials...${NC}"
-        if [[ -z "$GDRIVE_PASS" ]]; then
-            read -sp "  Google Drive password: " GDRIVE_PASS </dev/tty; echo "" >/dev/tty
-        fi
-        local test_json
-        test_json=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
-        if [[ $? -ne 0 || -z "$test_json" ]]; then
-            log_error "Wrong Google Drive password"
-            GDRIVE_PASS=""
-            return 1
-        fi
-        echo "$GDRIVE_PASS" > "$GDRIVE_PASS_FILE" && chmod 600 "$GDRIVE_PASS_FILE"
-        echo -e "  ${GREEN}✓${NC} Google Drive credentials OK"
-    fi
 
     echo -e "\n${GREEN}${BOLD}>>> LAUNCHING -- no more prompts, sit back <<<${NC}\n"
     export OUTPUT_MODE DC_NAME ALTITUDE
@@ -1043,9 +981,11 @@ run_diagnostics_menu() {
     log_info "Checking container image..."
     local needs=()
     for n in "${NODE_IPS[@]}"; do
-        local pip="${NODE_PUBLIC_IPS[$n]:-$CONTROL_PLANE_IP}"
-        local hi; hi=$(remote_ssh "$pip" "sudo crictl images 2>/dev/null | grep -c '$IMAGE_NAME' || echo 0" 2>/dev/null | tr -d '\r')
-        [[ "${hi:-0}" == "0" ]] && needs+=("$pip") || echo -e "  ${GREEN}✓${NC} $n"
+        local iip="${IP_MAP_INTERNAL[$n]:-}"
+        local hi
+        hi=$(remote_ssh "$CONTROL_PLANE_IP" \
+            "ssh -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip} 'sudo crictl images 2>/dev/null | grep -c ${IMAGE_NAME} || echo 0'" 2>/dev/null | tr -d '\r')
+        [[ "${hi:-0}" == "0" ]] && needs+=("$n") || echo -e "  ${GREEN}✓${NC} $n"
     done
     if [[ ${#needs[@]} -gt 0 ]]; then
         log_info "${#needs[@]} node(s) need image, building..."
