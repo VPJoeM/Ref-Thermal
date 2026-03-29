@@ -127,11 +127,11 @@ remote_ssh() {
     local method="${NODE_CONNECT[$pub_ip]:-direct}"
     if [[ "$method" == proxy:* ]]; then
         local priv_ip="${method#proxy:}"
-        ssh $SSH_OPTS \
+        ssh -A $SSH_OPTS \
             -o ProxyCommand="ssh $SSH_OPTS -i $DEFAULT_SSH_KEY -W %h:%p ${DEFAULT_SSH_USER}@${JUMP_HOST}" \
             -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${priv_ip}" "$@" 2>/dev/null
     else
-        ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${pub_ip}" "$@" 2>/dev/null
+        ssh -A $SSH_OPTS -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${pub_ip}" "$@" 2>/dev/null
     fi
 }
 
