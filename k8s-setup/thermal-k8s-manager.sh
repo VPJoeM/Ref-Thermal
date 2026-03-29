@@ -378,6 +378,17 @@ create_job_yaml() {
 launch_jobs() {
     local node_ips=("$@")
     local run_id="run-$(date +%s | tail -c 8)"
+
+    # cleanup any old thermal jobs/pods first to free GPUs
+    local old_jobs
+    old_jobs=$(kubectl_exec get jobs -n thermal-diagnostics --no-headers 2>/dev/null | awk '{print $1}')
+    if [[ -n "$old_jobs" ]]; then
+        log_info "Cleaning up old jobs..."
+        kubectl_exec delete jobs --all -n thermal-diagnostics 2>/dev/null
+        kubectl_exec delete pods --all -n thermal-diagnostics --force --grace-period=0 2>/dev/null
+        sleep 5
+    fi
+
     echo -e "\n${BLUE}${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BLUE}${BOLD}║           Launching Thermal Diagnostics                    ║${NC}"
     echo -e "${BLUE}${BOLD}╚════════════════════════════════════════════════════════════╝${NC}"
@@ -398,24 +409,18 @@ launch_jobs() {
         export COLLECT_NODE="$ch"
     fi
 
-    # pre-flight: check for already-running thermal tests on nodes
+    # pre-flight: kill stale thermal processes and clear TSR queues
     for nn in "${node_ips[@]}"; do
         local running
         running=$(node_exec "$nn" "pgrep -f 'thermal_diag\|dcgmproftester' 2>/dev/null | head -1" | tr -d '\r')
         if [[ -n "$running" ]]; then
-            log_warn "${nn} has a thermal test already running (PID $running)"
-            echo -ne "  Kill it and continue? (y/N): "
-            read -r -n 1 ans </dev/tty; echo "" >/dev/tty
-            if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
-                node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null
-                sleep 2
-                log_info "Killed old processes on $nn"
-            else
-                log_error "Aborting -- clear running tests first"
-                return 1
-            fi
+            log_info "Cleaning stale processes on ${nn}..."
+            node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag; sudo pkill -9 -f thermal_wrapper" </dev/null 2>/dev/null
+            sleep 2
         fi
+        node_exec "$nn" "sudo racadm jobqueue delete -i JID_CLEARALL" </dev/null 2>/dev/null &
     done
+    wait
 
     local job_names=() job_nodes=()
     for nn in "${node_ips[@]}"; do
@@ -459,10 +464,23 @@ monitor_jobs() {
             "$completed" "$total" "$running" "$failed" "$m" "$s"
         if [[ $((completed+failed)) -ge $total ]]; then
             echo ""; echo ""
-            [[ $failed -gt 0 ]] && log_warn "$failed job(s) failed"
+            if [[ $failed -gt 0 ]]; then
+                log_warn "$failed job(s) failed"
+                for jn in "${job_names[@]}"; do
+                    local pod_name
+                    pod_name=$(kubectl_exec get pods -n thermal-diagnostics -l job-name="$jn" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+                    local pod_status
+                    pod_status=$(kubectl_exec get pod "$pod_name" -n thermal-diagnostics -o jsonpath='{.status.phase}' 2>/dev/null)
+                    if [[ "$pod_status" != "Succeeded" ]]; then
+                        local reason
+                        reason=$(kubectl_exec describe pod "$pod_name" -n thermal-diagnostics 2>/dev/null | grep -E "Warning|Error|failed|unavailable" | tail -1 | sed 's/^ *//')
+                        [[ -n "$reason" ]] && echo -e "  ${RED}✗${NC} $jn: $reason"
+                    fi
+                done
+            fi
             log_success "All jobs finished. $completed succeeded, $failed failed."
 
-            # kill any orphaned thermal processes on nodes (containers can leave host processes behind)
+            # kill any orphaned thermal processes on nodes
             for nn in "${NODE_IPS[@]}"; do
                 node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null &
             done
