@@ -140,8 +140,9 @@ node_exec() {
     local node_name="$1"; shift
     local iip="${IP_MAP_INTERNAL[$node_name]:-}"
     [[ -z "$iip" ]] && { echo ""; return 1; }
+    local b64cmd; b64cmd=$(echo "$*" | base64)
     remote_ssh "$CONTROL_PLANE_IP" \
-        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${DEFAULT_SSH_USER}@${iip} $*"
+        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${DEFAULT_SSH_USER}@${iip} \"echo ${b64cmd} | base64 -d | bash\""
 }
 
 # copy a file FROM a worker node to local, relayed through control plane
