@@ -1223,6 +1223,10 @@ run_diagnostics_menu() {
     echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
     echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
     echo ""
+    echo -e "  ${YELLOW}${BOLD}NOTE:${NC} ${YELLOW}If any nodes have GPU pods running, they will be${NC}"
+    echo -e "  ${YELLOW}automatically drained (pods evicted), then uncordoned${NC}"
+    echo -e "  ${YELLOW}after the test completes.${NC}"
+    echo ""
     read -p "  Ready to go? (Y/n): " lc
     [[ "$lc" =~ ^[Nn]$ ]] && { echo "Cancelled."; return 0; }
 
