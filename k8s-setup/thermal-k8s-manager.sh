@@ -1392,19 +1392,37 @@ rerun_last() {
         log_error "No previous run found"
         return 1
     fi
+    if ! check_kubectl; then return 1; fi
+
+    # check for GPU pods on target nodes
+    NODES_TO_DRAIN=()
+    for nn in "${NODE_IPS[@]}"; do
+        local gpu_pods
+        gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.containers[*].resources.limits}
+{end}' 2>/dev/null | grep -i "nvidia" | grep -v "thermal-diag" | head -5)
+        if [[ -n "$gpu_pods" ]]; then
+            NODES_TO_DRAIN+=("$nn")
+            echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
+            echo "$gpu_pods" | while IFS= read -r line; do
+                local pname; pname=$(echo "$line" | awk '{print $1}')
+                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname}${NC}"
+            done
+        fi
+    done
+
     echo ""
     echo -e "${CYAN}${BOLD}Rerunning last configuration:${NC}"
     echo -e "  ${CYAN}Nodes:${NC}     ${#NODE_IPS[@]} (${NODE_IPS[*]})"
-    echo -e "  ${CYAN}Mode:${NC}      ${EXECUTION_MODE}"
     [[ "$EXECUTION_MODE" == "remote" ]] && echo -e "  ${CYAN}Control:${NC}  ${CONTROL_PLANE_IP}"
     echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
     echo -e "  ${CYAN}Key:${NC}       $(basename "$DEFAULT_SSH_KEY")"
+    [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]] && echo -e "  ${YELLOW}Drain:${NC}     ${#NODES_TO_DRAIN[@]} node(s) have GPU pods (will be evicted)"
     echo -e "  ${CYAN}Last run:${NC}  ${HIST_TIMESTAMP}"
     echo ""
     read -p "  Go? (Y/n): " rc
     [[ "$rc" =~ ^[Nn]$ ]] && return 0
     echo -e "\n${GREEN}${BOLD}>>> LAUNCHING -- no more prompts, sit back <<<${NC}\n"
-    if ! check_kubectl; then return 1; fi
     kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
     launch_jobs "${NODE_IPS[@]}"
 }
