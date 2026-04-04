@@ -412,43 +412,30 @@ launch_jobs() {
         export COLLECT_NODE="$ch"
     fi
 
-    # pre-flight: kill stale thermal processes and clear TSR queues
+    log_info "Preparing nodes..."
     for nn in "${node_ips[@]}"; do
-        local running
-        running=$(node_exec "$nn" "pgrep -f 'thermal_diag\|dcgmproftester' 2>/dev/null | head -1" | tr -d '\r')
-        if [[ -n "$running" ]]; then
-            log_info "Cleaning stale processes on ${nn}..."
-            node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag; sudo pkill -9 -f thermal_wrapper" </dev/null 2>/dev/null
-            sleep 2
-        fi
-        node_exec "$nn" "sudo racadm jobqueue delete -i JID_CLEARALL" </dev/null 2>/dev/null &
+        echo -ne "  ${YELLOW}→${NC} ${nn}: cleanup..."
+        node_exec "$nn" "sudo pkill -9 -f dcgmproftester 2>/dev/null; sudo pkill -9 -f thermal_diag 2>/dev/null; sudo racadm jobqueue delete -i JID_CLEARALL 2>/dev/null; sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null
+        echo -e " ${GREEN}✓${NC}"
     done
-    wait
 
     # drain nodes that have GPU workloads (detected during wizard)
     if [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]]; then
         log_info "Draining ${#NODES_TO_DRAIN[@]} node(s) with GPU workloads..."
         for nn in "${NODES_TO_DRAIN[@]}"; do
-            echo -ne "  ${YELLOW}→${NC} Draining ${nn}..."
+            echo -ne "  ${YELLOW}→${NC} ${nn}..."
             kubectl_exec cordon "$nn" >/dev/null 2>&1
             kubectl_exec drain "$nn" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s >/dev/null 2>&1
             if [[ $? -eq 0 ]]; then
-                echo -e " ${GREEN}✓${NC}"
+                echo -e " ${GREEN}drained${NC}"
             else
                 echo -e " ${YELLOW}partial${NC}"
             fi
         done
         NODES_TO_UNCORDON=("${NODES_TO_DRAIN[@]}")
         NODES_TO_DRAIN=()
-        echo ""
     fi
-
-    # clean old results so we only collect from this run
-    log_info "Clearing old results on nodes..."
-    for nn in "${node_ips[@]}"; do
-        node_exec "$nn" "sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null &
-    done
-    wait
+    echo ""
 
     local job_names=() job_nodes=()
     for nn in "${node_ips[@]}"; do
