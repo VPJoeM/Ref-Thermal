@@ -1016,18 +1016,20 @@ run_diagnostics_menu() {
     if ! check_kubectl; then return 1; fi
     kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
 
-    # pre-install rclone on control plane if gdrive output (do it now, not after 30-min test)
+    # pre-install rclone + SA key on control plane (do it now, not after 30-min test)
     if [[ "$OUTPUT_MODE" == "gdrive" ]]; then
-        local has_rc; has_rc=$(remote_ssh "$CONTROL_PLANE_IP" "which rclone 2>/dev/null" 2>/dev/null | tr -d '\r')
+        local has_rc; has_rc=$(remote_ssh "$CONTROL_PLANE_IP" "which rclone 2>/dev/null" </dev/null 2>/dev/null | tr -d '\r')
         if [[ -z "$has_rc" ]]; then
             log_info "Pre-installing rclone on control plane..."
-            remote_ssh "$CONTROL_PLANE_IP" "curl -s https://rclone.org/install.sh | sudo bash" >/dev/null 2>&1
+            remote_ssh "$CONTROL_PLANE_IP" "curl -s https://rclone.org/install.sh | sudo bash" </dev/null >/dev/null 2>&1
+        else
+            log_info "rclone ready on control plane"
         fi
-        # deploy SA key now too
         local _sa_json
         _sa_json=$(echo "$GDRIVE_SA_ENC" | base64 -d | openssl enc -aes-256-cbc -pbkdf2 -d -pass "pass:${GDRIVE_PASS}" 2>/dev/null)
-        echo "$_sa_json" | remote_ssh "$CONTROL_PLANE_IP" "sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json"
-        unset _sa_json
+        local _sa_b64; _sa_b64=$(echo "$_sa_json" | base64)
+        remote_ssh "$CONTROL_PLANE_IP" "echo '${_sa_b64}' | base64 -d | sudo tee /tmp/.gdrive-sa.json > /dev/null && sudo chmod 600 /tmp/.gdrive-sa.json" </dev/null
+        unset _sa_json _sa_b64
         log_success "Google Drive upload ready"
     fi
 
