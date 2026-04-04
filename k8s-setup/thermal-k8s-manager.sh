@@ -604,10 +604,13 @@ WATCHER_HEREDOC
     watcher_script="${watcher_script//__GDRIVE_TEAM_DRIVE__/$GDRIVE_TEAM_DRIVE}"
     watcher_script="${watcher_script//__OUTPUT_MODE__/${OUTPUT_MODE:-local}}"
 
-    # deploy to control plane via base64 to avoid pipe/stdin conflicts
-    local watcher_b64; watcher_b64=$(echo "$watcher_script" | base64)
-    remote_ssh "$CONTROL_PLANE_IP" "echo '${watcher_b64}' | base64 -d > '${watcher_path}' && chmod +x '${watcher_path}'" </dev/null
-    remote_ssh "$CONTROL_PLANE_IP" "nohup sudo bash '${watcher_path}' > '${watcher_log}' 2>&1 &" </dev/null
+    # deploy to control plane: write locally then SCP
+    local local_watcher="/tmp/.thermal-watcher-local-$$.sh"
+    echo "$watcher_script" > "$local_watcher"
+    chmod +x "$local_watcher"
+    remote_scp_to "$CONTROL_PLANE_IP" "$local_watcher" "${watcher_path}"
+    rm -f "$local_watcher"
+    remote_ssh "$CONTROL_PLANE_IP" "chmod +x '${watcher_path}' && nohup sudo bash '${watcher_path}' > '${watcher_log}' 2>&1 &" </dev/null
 
     echo ""
     echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
