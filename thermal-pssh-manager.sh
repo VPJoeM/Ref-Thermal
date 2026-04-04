@@ -343,15 +343,15 @@ deploy_and_run() {
         fi
     done
 
-    # clean old files
+    # clean old files + stale results so we only collect from this run
     if [[ ${#direct_hosts[@]} -gt 0 ]]; then
         local dfile="/tmp/thermal-direct-hosts-$$.txt"
         printf '%s\n' "${direct_hosts[@]}" > "$dfile"
         $PSSH_CMD -h "$dfile" -l "$SSH_USER" -x "-i $SSH_KEY $SSH_OPTS_STR" \
-            -t 10 "sudo rm -f /tmp/thermal_diag.sh /tmp/thermal_wrapper.sh /tmp/.thermal-status" >/dev/null 2>&1
+            -t 10 "sudo rm -rf /tmp/thermal_diag.sh /tmp/thermal_wrapper.sh /tmp/.thermal-status /root/TDAS/dcgmprof-*" >/dev/null 2>&1
     fi
     for ip in "${proxy_hosts[@]}"; do
-        ssh_cmd "$ip" "sudo rm -f /tmp/thermal_diag.sh /tmp/thermal_wrapper.sh /tmp/.thermal-status" </dev/null 2>/dev/null
+        ssh_cmd "$ip" "sudo rm -rf /tmp/thermal_diag.sh /tmp/thermal_wrapper.sh /tmp/.thermal-status /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null
     done
 
     # upload thermal script
