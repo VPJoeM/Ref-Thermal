@@ -59,6 +59,7 @@ declare -A IP_MAP_INTERNAL
 declare -A IP_MAP_HOSTNAME
 declare -A NODE_PUBLIC_IPS
 declare -A NODE_CONNECT    # ip -> "direct" or "proxy:private_ip"
+NODES_TO_UNCORDON=()       # nodes drained pre-test, uncordoned post-test
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
@@ -423,6 +424,50 @@ launch_jobs() {
     done
     wait
 
+    # pre-flight: check for GPU-consuming pods on target nodes, drain if needed
+    local needs_drain=()
+    for nn in "${node_ips[@]}"; do
+        local gpu_pods
+        gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.containers[*].resources.limits}
+{end}' 2>/dev/null | grep -i "nvidia" | grep -v "thermal-diag" | head -5)
+        if [[ -n "$gpu_pods" ]]; then
+            needs_drain+=("$nn")
+            echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads running:"
+            echo "$gpu_pods" | while IFS= read -r line; do
+                local pname; pname=$(echo "$line" | awk '{print $1}')
+                echo -e "      ${DIM}${pname}${NC}"
+            done
+        fi
+    done
+
+    if [[ ${#needs_drain[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${YELLOW}${BOLD}${#needs_drain[@]} node(s) have GPU pods that will block the thermal test.${NC}"
+        echo -e "  ${DIM}These nodes need to be drained (existing pods evicted) before testing.${NC}"
+        echo -e "  ${DIM}Nodes will be uncordoned automatically after the test completes.${NC}"
+        echo ""
+        read -p "  Drain these nodes and continue? (Y/n): " drain_ans
+        if [[ "$drain_ans" =~ ^[Nn]$ ]]; then
+            log_error "Cannot run thermal test with GPU pods occupying the nodes"
+            return 1
+        fi
+
+        for nn in "${needs_drain[@]}"; do
+            echo -ne "  ${YELLOW}→${NC} Draining ${nn}..."
+            kubectl_exec cordon "$nn" >/dev/null 2>&1
+            kubectl_exec drain "$nn" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s >/dev/null 2>&1
+            if [[ $? -eq 0 ]]; then
+                echo -e " ${GREEN}✓${NC}"
+            else
+                echo -e " ${YELLOW}partial${NC} (some pods may remain)"
+            fi
+        done
+        echo ""
+        log_info "Nodes drained. Will uncordon after test completes."
+        NODES_TO_UNCORDON=("${needs_drain[@]}")
+    fi
+
     local job_names=() job_nodes=()
     for nn in "${node_ips[@]}"; do
         local gc; gc=$(get_node_gpu_count "$nn")
@@ -486,6 +531,15 @@ monitor_jobs() {
                 node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null &
             done
             wait
+
+            # uncordon nodes that were drained for this test
+            if [[ ${#NODES_TO_UNCORDON[@]} -gt 0 ]]; then
+                log_info "Uncordoning ${#NODES_TO_UNCORDON[@]} node(s)..."
+                for nn in "${NODES_TO_UNCORDON[@]}"; do
+                    kubectl_exec uncordon "$nn" >/dev/null 2>&1 && echo -e "  ${GREEN}✓${NC} $nn uncordoned" || echo -e "  ${YELLOW}!${NC} $nn uncordon failed"
+                done
+                NODES_TO_UNCORDON=()
+            fi
 
             # save failed nodes for retry
             if [[ $failed -gt 0 ]]; then
