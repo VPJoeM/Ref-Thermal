@@ -423,7 +423,12 @@ launch_jobs() {
     [[ ${#job_names[@]} -eq 0 ]] && { log_error "No jobs created"; return 1; }
 
     echo -ne "  ${DIM}Applying ${#job_names[@]} jobs...${NC}"
-    echo "$all_yaml" | kubectl_exec apply -f - 2>/dev/null
+    if [[ "$EXECUTION_MODE" == "remote" ]]; then
+        printf '%s' "$all_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
+            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f -" 2>/dev/null
+    else
+        echo "$all_yaml" | kubectl_exec apply -f - 2>/dev/null
+    fi
     echo -e " ${GREEN}✓${NC}"
 
     # wait 15s then check for GPU scheduling failures (single kubectl call)
@@ -639,7 +644,13 @@ spec:
 WYAML
     )
 
-    echo "$watcher_yaml" | kubectl_exec apply -f - 2>/dev/null
+    # apply watcher YAML - use raw ssh without -A to avoid stdin conflict with pipe
+    if [[ "$EXECUTION_MODE" == "remote" ]]; then
+        printf '%s' "$watcher_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
+            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f -" 2>/dev/null
+    else
+        echo "$watcher_yaml" | kubectl_exec apply -f - 2>/dev/null
+    fi
     local watcher_log="/tmp/.thermal-watcher-${run_id}.log"
 
     echo ""
