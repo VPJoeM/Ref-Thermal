@@ -420,36 +420,32 @@ launch_jobs() {
     wait
     echo -e " ${GREEN}✓${NC}"
 
-    # create jobs on all nodes
-    local job_names=() job_nodes=()
+    # generate all job YAMLs locally, apply in single kubectl call
+    local all_yaml="" job_names=() job_nodes=()
     for nn in "${node_ips[@]}"; do
-        local gc; gc=$(get_node_gpu_count "$nn")
-        [[ "${gc:-0}" == "0" ]] && gc=$DEFAULT_GPU_COUNT
+        local gc=$DEFAULT_GPU_COUNT
         local jy; jy=$(create_job_yaml "$nn" "$run_id" "${ALTITUDE:-0}" "${OUTPUT_MODE:-local}" "${DC_NAME:-thermal-run}" "$gc")
-        echo -e "  ${YELLOW}→${NC} ${nn} (${gc} GPUs)..."
-        if echo "$jy" | kubectl_exec apply -f - 2>/dev/null; then
-            local jn; jn=$(echo "$jy" | grep "name: thermal-diag-" | head -1 | awk '{print $2}')
-            job_names+=("$jn"); job_nodes+=("$nn")
-            echo -e "  ${GREEN}✓${NC} $jn"
-        else
-            log_error "Failed on $nn"
-        fi
+        local jn; jn=$(echo "$jy" | grep "name: thermal-diag-" | head -1 | awk '{print $2}')
+        job_names+=("$jn"); job_nodes+=("$nn")
+        all_yaml+="${jy}"$'\n---\n'
+        echo -e "  ${YELLOW}→${NC} ${nn} (${gc} GPUs) → ${jn}"
     done
     [[ ${#job_names[@]} -eq 0 ]] && { log_error "No jobs created"; return 1; }
 
-    # wait 15s then check for GPU scheduling failures
-    echo ""; echo -ne "  ${DIM}Waiting for pods to schedule...${NC}"
+    echo -ne "  ${DIM}Applying ${#job_names[@]} jobs...${NC}"
+    echo "$all_yaml" | kubectl_exec apply -f - 2>/dev/null
+    echo -e " ${GREEN}✓${NC}"
+
+    # wait 15s then check for GPU scheduling failures (single kubectl call)
+    echo -ne "  ${DIM}Waiting for pods to schedule...${NC}"
     sleep 15
     local stuck_nodes=()
-    for i in "${!job_names[@]}"; do
-        local jn="${job_names[$i]}" nn="${job_nodes[$i]}"
-        local pod_phase
-        pod_phase=$(kubectl_exec get pods -n thermal-diagnostics -l "job-name=${jn}" \
-            -o jsonpath='{.items[0].status.phase}' 2>/dev/null | tr -d '\r')
-        local pod_reason
-        pod_reason=$(kubectl_exec get pods -n thermal-diagnostics -l "job-name=${jn}" \
-            -o jsonpath='{.items[0].status.reason}' 2>/dev/null | tr -d '\r')
-        if [[ "$pod_phase" == "Pending" || "$pod_reason" == *"Admission"* || "$pod_phase" == "Failed" ]]; then
+    local pod_statuses
+    pod_statuses=$(kubectl_exec get pods -n thermal-diagnostics -l "thermal-run=${run_id}" \
+        -o jsonpath='{range .items[*]}{.spec.nodeName} {.status.phase} {.status.reason}{"\n"}{end}' 2>/dev/null)
+    for nn in "${node_ips[@]}"; do
+        local node_status; node_status=$(echo "$pod_statuses" | grep "^${nn} ")
+        if echo "$node_status" | grep -qE "Pending|Failed|Admission"; then
             stuck_nodes+=("$nn")
         fi
     done
@@ -1507,9 +1503,7 @@ rerun_last() {
     read -p "  Go? (Y/n): " rc
     [[ "$rc" =~ ^[Nn]$ ]] && return 0
     echo -e "\n${GREEN}${BOLD}>>> LAUNCHING <<<${NC}\n"
-    echo -ne "  ${DIM}Setting up namespace...${NC}"
-    kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
-    echo -e " ${GREEN}✓${NC}"
+    kubectl_exec apply -f "$NAMESPACE_YAML" >/dev/null 2>&1
     launch_jobs "${NODE_IPS[@]}"
 }
 
