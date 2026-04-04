@@ -614,15 +614,35 @@ collect_and_upload_gdrive_from_node() {
             [[ $? -eq 0 ]] && uploaded=1
         fi
     else
-        # SSH relay: collect each node's results through control plane
-        log_info "Collecting results via control plane relay..."
+        # collect via kubectl cp (no SSH to workers needed)
+        log_info "Collecting results via kubectl cp..."
         remote_ssh "$CONTROL_PLANE_IP" "mkdir -p /tmp/.thermal-rollup" </dev/null 2>/dev/null
+
+        # get pod names for each node
         while read -r nn <&3; do
             [[ -z "$nn" ]] && continue
             echo -ne "  ${YELLOW}→${NC} ${nn}..."
 
+            local pod_name
+            pod_name=$(kubectl_exec get pods -n thermal-diagnostics -l thermal-run="${run_id}" \
+                --field-selector "spec.nodeName=${nn}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null | tr -d '\r')
+
+            if [[ -z "$pod_name" ]]; then
+                # fallback: find any thermal pod on this node
+                pod_name=$(kubectl_exec get pods -n thermal-diagnostics \
+                    --field-selector "spec.nodeName=${nn}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null | tr -d '\r')
+            fi
+
+            if [[ -z "$pod_name" ]]; then
+                echo -e " ${RED}no pod found${NC}"
+                continue
+            fi
+
+            # find the latest result zip inside the pod
             local rzip
-            rzip=$(node_exec "$nn" "sudo bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1'" | tr -d '\r')
+            rzip=$(kubectl_exec exec "$pod_name" -n thermal-diagnostics -- \
+                bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1' 2>/dev/null | tr -d '\r')
+
             if [[ -z "$rzip" ]]; then
                 echo -e " ${RED}no results${NC}"
                 continue
@@ -634,15 +654,11 @@ collect_and_upload_gdrive_from_node() {
             [[ "$st" == "$zb" ]] && st="UNKNOWN"
             nzn="${nn}-${st}.zip"
 
-            # stage file readable, pull to control plane staging area
-            local iip="${IP_MAP_INTERNAL[$nn]:-}"
-            node_exec "$nn" "sudo cp '$rzip' /tmp/thermal-relay.zip && sudo chmod 644 /tmp/thermal-relay.zip" </dev/null 2>/dev/null
-            remote_ssh "$CONTROL_PLANE_IP" \
-                "scp -o StrictHostKeyChecking=no ${DEFAULT_SSH_USER}@${iip}:/tmp/thermal-relay.zip /tmp/.thermal-rollup/${nzn}" </dev/null 2>/dev/null
-            node_exec "$nn" "rm -f /tmp/thermal-relay.zip" </dev/null 2>/dev/null
+            # kubectl cp from pod to control plane
+            kubectl_exec cp "thermal-diagnostics/${pod_name}:${rzip}" "/tmp/.thermal-rollup/${nzn}" 2>/dev/null
 
             local verify
-            verify=$(remote_ssh "$CONTROL_PLANE_IP" "ls -lh /tmp/.thermal-rollup/${nzn} 2>/dev/null" | awk '{print $5}' | tr -d '\r')
+            verify=$(remote_ssh "$CONTROL_PLANE_IP" "ls -lh /tmp/.thermal-rollup/${nzn} 2>/dev/null" </dev/null | awk '{print $5}' | tr -d '\r')
             if [[ -n "$verify" ]]; then
                 echo -e " ${GREEN}✓${NC} (${verify})"
                 nfs_node_count=$((nfs_node_count + 1))
@@ -1078,26 +1094,27 @@ run_diagnostics_menu() {
             CONTROL_PLANE_IP="${BASH_REMATCH[1]}"
         fi
 
-        # SSH still needed for result collection
+        # SSH key -- optional with kubeconfig (kubectl cp handles collection)
         echo ""
-        echo -e "  ${DIM}SSH needed for result collection from nodes${NC}"
-        echo -e "${CYAN}  SSH Key${NC}"
-        _pick_ssh_key || return 1
-        read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
+        echo -e "  ${DIM}SSH key is optional with kubeconfig (results collected via kubectl cp)${NC}"
+        echo -ne "  ${CYAN}Set up SSH access? (y/N):${NC} "
+        read -r setup_ssh
+        if [[ "$setup_ssh" =~ ^[Yy]$ ]]; then
+            echo -e "${CYAN}  SSH Key${NC}"
+            _pick_ssh_key || return 1
+            read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
 
-        if [[ -n "$CONTROL_PLANE_IP" ]]; then
-            echo -ne "  Testing SSH to ${CONTROL_PLANE_IP}: "
-            if remote_ssh "$CONTROL_PLANE_IP" "echo ok" </dev/null &>/dev/null 2>&1; then
-                NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
-                echo -e "${GREEN}OK${NC}"
-            else
-                echo -e "${YELLOW}not reachable${NC}"
-                read -p "  Control plane SSH IP: " CONTROL_PLANE_IP
-                NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
+            if [[ -n "$CONTROL_PLANE_IP" ]]; then
+                echo -ne "  Testing SSH to ${CONTROL_PLANE_IP}: "
+                if remote_ssh "$CONTROL_PLANE_IP" "echo ok" </dev/null &>/dev/null 2>&1; then
+                    NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
+                    echo -e "${GREEN}OK${NC}"
+                else
+                    echo -e "${YELLOW}not reachable${NC}"
+                    read -p "  Control plane SSH IP: " CONTROL_PLANE_IP
+                    NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
+                fi
             fi
-        else
-            read -p "  Control plane SSH IP (for node access): " CONTROL_PLANE_IP
-            NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
         fi
     else
         # SSH mode
