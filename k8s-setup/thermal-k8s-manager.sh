@@ -127,13 +127,15 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Identit
 remote_ssh() {
     local pub_ip="$1"; shift
     local method="${NODE_CONNECT[$pub_ip]:-direct}"
+    # use -A (agent forwarding) only when stdin is a terminal, not when piped
+    local agent_flag=""; [[ -t 0 ]] && agent_flag="-A"
     if [[ "$method" == proxy:* ]]; then
         local priv_ip="${method#proxy:}"
-        ssh -A $SSH_OPTS \
+        ssh $agent_flag $SSH_OPTS \
             -o ProxyCommand="ssh $SSH_OPTS -i $DEFAULT_SSH_KEY -W %h:%p ${DEFAULT_SSH_USER}@${JUMP_HOST}" \
             -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${priv_ip}" "$@" 2>/dev/null
     else
-        ssh -A $SSH_OPTS -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${pub_ip}" "$@" 2>/dev/null
+        ssh $agent_flag $SSH_OPTS -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${pub_ip}" "$@" 2>/dev/null
     fi
 }
 
@@ -253,7 +255,12 @@ kubectl_exec() {
         remote)
             local cmd="sudo kubectl"
             for arg in "$@"; do cmd="$cmd $(printf '%q' "$arg")"; done
-            remote_ssh "$CONTROL_PLANE_IP" "$cmd" ;;
+            if [[ ! -t 0 ]]; then
+                # stdin is piped -- don't use -A to avoid agent/stdin conflict
+                ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "$cmd"
+            else
+                remote_ssh "$CONTROL_PLANE_IP" "$cmd" </dev/null
+            fi ;;
     esac
 }
 
@@ -423,12 +430,7 @@ launch_jobs() {
     [[ ${#job_names[@]} -eq 0 ]] && { log_error "No jobs created"; return 1; }
 
     echo -ne "  ${DIM}Applying ${#job_names[@]} jobs...${NC}"
-    if [[ "$EXECUTION_MODE" == "remote" ]]; then
-        echo "$all_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
-            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f - 2>/dev/null"
-    else
-        echo "$all_yaml" | kubectl_exec apply -f - 2>/dev/null
-    fi
+    echo "$all_yaml" | kubectl_exec apply -f - 2>/dev/null
     echo -e " ${GREEN}✓${NC}"
 
     # wait 15s then check for GPU scheduling failures (single kubectl call)
@@ -644,13 +646,7 @@ spec:
 WYAML
     )
 
-    # apply watcher YAML - use raw ssh without -A to avoid stdin conflict with pipe
-    if [[ "$EXECUTION_MODE" == "remote" ]]; then
-        echo "$watcher_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
-            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f - 2>/dev/null"
-    else
-        echo "$watcher_yaml" | kubectl_exec apply -f - 2>/dev/null
-    fi
+    echo "$watcher_yaml" | kubectl_exec apply -f - 2>/dev/null
     local watcher_log="/tmp/.thermal-watcher-${run_id}.log"
 
     echo ""
