@@ -412,12 +412,12 @@ launch_jobs() {
         export COLLECT_NODE="$ch"
     fi
 
-    log_info "Preparing nodes..."
+    log_info "Preparing ${#node_ips[@]} node(s)..."
     for nn in "${node_ips[@]}"; do
-        echo -ne "  ${YELLOW}→${NC} ${nn}: cleanup..."
-        node_exec "$nn" "sudo pkill -9 -f dcgmproftester 2>/dev/null; sudo pkill -9 -f thermal_diag 2>/dev/null; sudo racadm jobqueue delete -i JID_CLEARALL 2>/dev/null; sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null
-        echo -e " ${GREEN}✓${NC}"
+        node_exec "$nn" "sudo pkill -9 -f dcgmproftester 2>/dev/null; sudo pkill -9 -f thermal_diag 2>/dev/null; sudo racadm jobqueue delete -i JID_CLEARALL 2>/dev/null; sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null &
     done
+    wait
+    log_success "Nodes ready"
 
     # drain nodes that have GPU workloads (detected during wizard)
     if [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]]; then
@@ -1175,24 +1175,27 @@ run_diagnostics_menu() {
         2) OUTPUT_MODE="local" ;;
     esac
 
-    # pre-flight: check for pods with actual GPU resource limits
+    # single query for all GPU-consuming pods across target nodes
     NODES_TO_DRAIN=()
-    for nn in "${NODE_IPS[@]}"; do
-        local gpu_pods
-        gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
-            -o "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
-            2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag | head -5)
-        if [[ -n "$gpu_pods" ]]; then
-            NODES_TO_DRAIN+=("$nn")
-            echo ""
-            echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
-            echo "$gpu_pods" | while IFS= read -r line; do
-                local pname; pname=$(echo "$line" | awk '{print $1}')
-                local gpuc; gpuc=$(echo "$line" | awk '{print $2}')
-                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
-            done
-        fi
-    done
+    local all_gpu_pods
+    all_gpu_pods=$(kubectl_exec get pods --all-namespaces \
+        -o "jsonpath={range .items[*]}{.spec.nodeName} {.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
+        2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag)
+    if [[ -n "$all_gpu_pods" ]]; then
+        for nn in "${NODE_IPS[@]}"; do
+            local node_gpu; node_gpu=$(echo "$all_gpu_pods" | grep "^${nn} ")
+            if [[ -n "$node_gpu" ]]; then
+                NODES_TO_DRAIN+=("$nn")
+                echo ""
+                echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
+                echo "$node_gpu" | while IFS= read -r line; do
+                    local pname; pname=$(echo "$line" | awk '{print $2}')
+                    local gpuc; gpuc=$(echo "$line" | awk '{print $3}')
+                    [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
+                done
+            fi
+        done
+    fi
 
     # summary
     echo ""
@@ -1389,25 +1392,28 @@ rerun_last() {
     fi
     if ! check_kubectl; then return 1; fi
 
-    # check for pods with actual GPU resource limits
+    # single query for all GPU-consuming pods across the cluster
     NODES_TO_DRAIN=()
-    echo -ne "  ${DIM}Checking nodes for GPU workloads...${NC}"
-    for nn in "${NODE_IPS[@]}"; do
-        local gpu_pods
-        gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
-            -o "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
-            2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag | head -5)
-        if [[ -n "$gpu_pods" ]]; then
-            NODES_TO_DRAIN+=("$nn")
-            echo ""
-            echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
-            echo "$gpu_pods" | while IFS= read -r line; do
-                local pname; pname=$(echo "$line" | awk '{print $1}')
-                local gpuc; gpuc=$(echo "$line" | awk '{print $2}')
-                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
-            done
-        fi
-    done
+    echo -ne "  ${DIM}Checking for GPU workloads...${NC}"
+    local all_gpu_pods
+    all_gpu_pods=$(kubectl_exec get pods --all-namespaces \
+        -o "jsonpath={range .items[*]}{.spec.nodeName} {.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
+        2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag)
+    if [[ -n "$all_gpu_pods" ]]; then
+        for nn in "${NODE_IPS[@]}"; do
+            local node_gpu; node_gpu=$(echo "$all_gpu_pods" | grep "^${nn} ")
+            if [[ -n "$node_gpu" ]]; then
+                NODES_TO_DRAIN+=("$nn")
+                echo ""
+                echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
+                echo "$node_gpu" | while IFS= read -r line; do
+                    local pname; pname=$(echo "$line" | awk '{print $2}')
+                    local gpuc; gpuc=$(echo "$line" | awk '{print $3}')
+                    [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
+                done
+            fi
+        done
+    fi
     [[ ${#NODES_TO_DRAIN[@]} -eq 0 ]] && echo -e " ${GREEN}clear${NC}"
 
     echo ""
