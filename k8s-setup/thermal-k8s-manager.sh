@@ -443,6 +443,13 @@ launch_jobs() {
         echo ""
     fi
 
+    # clean old results so we only collect from this run
+    log_info "Clearing old results on nodes..."
+    for nn in "${node_ips[@]}"; do
+        node_exec "$nn" "sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null &
+    done
+    wait
+
     local job_names=() job_nodes=()
     for nn in "${node_ips[@]}"; do
         local gc; gc=$(get_node_gpu_count "$nn")
