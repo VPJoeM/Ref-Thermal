@@ -1396,6 +1396,7 @@ rerun_last() {
 
     # check for GPU pods on target nodes
     NODES_TO_DRAIN=()
+    echo -ne "  ${DIM}Checking nodes for GPU workloads...${NC}"
     for nn in "${NODE_IPS[@]}"; do
         local gpu_pods
         gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
@@ -1403,6 +1404,7 @@ rerun_last() {
 {end}' 2>/dev/null | grep -i "nvidia" | grep -v "thermal-diag" | head -5)
         if [[ -n "$gpu_pods" ]]; then
             NODES_TO_DRAIN+=("$nn")
+            echo ""
             echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
             echo "$gpu_pods" | while IFS= read -r line; do
                 local pname; pname=$(echo "$line" | awk '{print $1}')
@@ -1410,6 +1412,7 @@ rerun_last() {
             done
         fi
     done
+    [[ ${#NODES_TO_DRAIN[@]} -eq 0 ]] && echo -e " ${GREEN}clear${NC}"
 
     echo ""
     echo -e "${CYAN}${BOLD}Rerunning last configuration:${NC}"
