@@ -412,37 +412,20 @@ launch_jobs() {
         export COLLECT_NODE="$ch"
     fi
 
+    # clean stale results + processes in parallel
     log_info "Preparing ${#node_ips[@]} node(s)..."
     for nn in "${node_ips[@]}"; do
         node_exec "$nn" "sudo pkill -9 -f dcgmproftester 2>/dev/null; sudo pkill -9 -f thermal_diag 2>/dev/null; sudo racadm jobqueue delete -i JID_CLEARALL 2>/dev/null; sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null &
     done
     wait
-    log_success "Nodes ready"
 
-    # drain nodes that have GPU workloads (detected during wizard)
-    if [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]]; then
-        log_info "Draining ${#NODES_TO_DRAIN[@]} node(s) with GPU workloads..."
-        for nn in "${NODES_TO_DRAIN[@]}"; do
-            echo -ne "  ${YELLOW}→${NC} ${nn}..."
-            kubectl_exec cordon "$nn" >/dev/null 2>&1
-            kubectl_exec drain "$nn" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s >/dev/null 2>&1
-            if [[ $? -eq 0 ]]; then
-                echo -e " ${GREEN}drained${NC}"
-            else
-                echo -e " ${YELLOW}partial${NC}"
-            fi
-        done
-        NODES_TO_UNCORDON=("${NODES_TO_DRAIN[@]}")
-        NODES_TO_DRAIN=()
-    fi
-    echo ""
-
+    # create jobs on all nodes
     local job_names=() job_nodes=()
     for nn in "${node_ips[@]}"; do
         local gc; gc=$(get_node_gpu_count "$nn")
         [[ "${gc:-0}" == "0" ]] && gc=$DEFAULT_GPU_COUNT
         local jy; jy=$(create_job_yaml "$nn" "$run_id" "${ALTITUDE:-0}" "${OUTPUT_MODE:-local}" "${DC_NAME:-thermal-run}" "$gc")
-        echo -e "  ${YELLOW}→${NC} Creating job on ${nn} (${gc} GPUs)..."
+        echo -e "  ${YELLOW}→${NC} ${nn} (${gc} GPUs)..."
         if echo "$jy" | kubectl_exec apply -f - 2>/dev/null; then
             local jn; jn=$(echo "$jy" | grep "name: thermal-diag-" | head -1 | awk '{print $2}')
             job_names+=("$jn"); job_nodes+=("$nn")
@@ -450,10 +433,63 @@ launch_jobs() {
         else
             log_error "Failed on $nn"
         fi
-        sleep 1
     done
     [[ ${#job_names[@]} -eq 0 ]] && { log_error "No jobs created"; return 1; }
-    echo ""; log_info "Monitoring..."
+
+    # wait 15s then check for GPU scheduling failures
+    echo ""; echo -ne "  ${DIM}Waiting for pods to schedule...${NC}"
+    sleep 15
+    local stuck_nodes=()
+    for i in "${!job_names[@]}"; do
+        local jn="${job_names[$i]}" nn="${job_nodes[$i]}"
+        local pod_phase
+        pod_phase=$(kubectl_exec get pods -n thermal-diagnostics -l "job-name=${jn}" \
+            -o jsonpath='{.items[0].status.phase}' 2>/dev/null | tr -d '\r')
+        local pod_reason
+        pod_reason=$(kubectl_exec get pods -n thermal-diagnostics -l "job-name=${jn}" \
+            -o jsonpath='{.items[0].status.reason}' 2>/dev/null | tr -d '\r')
+        if [[ "$pod_phase" == "Pending" || "$pod_reason" == *"Admission"* || "$pod_phase" == "Failed" ]]; then
+            stuck_nodes+=("$nn")
+        fi
+    done
+    echo ""
+
+    if [[ ${#stuck_nodes[@]} -gt 0 ]]; then
+        log_warn "${#stuck_nodes[@]} node(s) can't schedule -- GPU likely occupied"
+        echo -e "  ${DIM}Will drain, delete failed jobs, and retry${NC}"
+        echo ""
+
+        # drain stuck nodes
+        NODES_TO_UNCORDON=("${stuck_nodes[@]}")
+        for nn in "${stuck_nodes[@]}"; do
+            echo -ne "  ${YELLOW}→${NC} Draining ${nn}..."
+            kubectl_exec cordon "$nn" >/dev/null 2>&1
+            kubectl_exec drain "$nn" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s >/dev/null 2>&1
+            echo -e " ${GREEN}✓${NC}"
+        done
+
+        # delete failed jobs and recreate
+        for i in "${!job_names[@]}"; do
+            local nn="${job_nodes[$i]}"
+            for sn in "${stuck_nodes[@]}"; do
+                if [[ "$nn" == "$sn" ]]; then
+                    kubectl_exec delete job "${job_names[$i]}" -n thermal-diagnostics --force 2>/dev/null
+                    sleep 2
+                    local gc; gc=$(get_node_gpu_count "$nn")
+                    [[ "${gc:-0}" == "0" ]] && gc=$DEFAULT_GPU_COUNT
+                    local jy; jy=$(create_job_yaml "$nn" "$run_id" "${ALTITUDE:-0}" "${OUTPUT_MODE:-local}" "${DC_NAME:-thermal-run}" "$gc")
+                    if echo "$jy" | kubectl_exec apply -f - 2>/dev/null; then
+                        local new_jn; new_jn=$(echo "$jy" | grep "name: thermal-diag-" | head -1 | awk '{print $2}')
+                        job_names[$i]="$new_jn"
+                        echo -e "  ${GREEN}✓${NC} Retried ${nn}: $new_jn"
+                    fi
+                fi
+            done
+        done
+        echo ""
+    fi
+
+    log_info "Monitoring..."
     monitor_jobs "$run_id" "${job_names[@]}"
 }
 
@@ -1175,28 +1211,6 @@ run_diagnostics_menu() {
         2) OUTPUT_MODE="local" ;;
     esac
 
-    # single query for all GPU-consuming pods across target nodes
-    NODES_TO_DRAIN=()
-    local all_gpu_pods
-    all_gpu_pods=$(kubectl_exec get pods --all-namespaces \
-        -o "jsonpath={range .items[*]}{.spec.nodeName} {.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
-        2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag)
-    if [[ -n "$all_gpu_pods" ]]; then
-        for nn in "${NODE_IPS[@]}"; do
-            local node_gpu; node_gpu=$(echo "$all_gpu_pods" | grep "^${nn} ")
-            if [[ -n "$node_gpu" ]]; then
-                NODES_TO_DRAIN+=("$nn")
-                echo ""
-                echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
-                echo "$node_gpu" | while IFS= read -r line; do
-                    local pname; pname=$(echo "$line" | awk '{print $2}')
-                    local gpuc; gpuc=$(echo "$line" | awk '{print $3}')
-                    [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
-                done
-            fi
-        done
-    fi
-
     # summary
     echo ""
     echo -e "${BLUE}${BOLD}══════════════════════════════════════════════════════════${NC}"
@@ -1207,9 +1221,6 @@ run_diagnostics_menu() {
     echo -e "  ${CYAN}Key:${NC}       $(basename "$DEFAULT_SSH_KEY")"
     echo -e "  ${CYAN}Site:${NC}      ${DC_NAME} (${ALTITUDE} ft)"
     echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
-    if [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]]; then
-        echo -e "  ${YELLOW}Drain:${NC}     ${#NODES_TO_DRAIN[@]} node(s) have GPU pods (will be evicted)"
-    fi
     echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
     echo ""
     read -p "  Ready to go? (Y/n): " lc
@@ -1392,37 +1403,12 @@ rerun_last() {
     fi
     if ! check_kubectl; then return 1; fi
 
-    # single query for all GPU-consuming pods across the cluster
-    NODES_TO_DRAIN=()
-    echo -ne "  ${DIM}Checking for GPU workloads...${NC}"
-    local all_gpu_pods
-    all_gpu_pods=$(kubectl_exec get pods --all-namespaces \
-        -o "jsonpath={range .items[*]}{.spec.nodeName} {.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
-        2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag)
-    if [[ -n "$all_gpu_pods" ]]; then
-        for nn in "${NODE_IPS[@]}"; do
-            local node_gpu; node_gpu=$(echo "$all_gpu_pods" | grep "^${nn} ")
-            if [[ -n "$node_gpu" ]]; then
-                NODES_TO_DRAIN+=("$nn")
-                echo ""
-                echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
-                echo "$node_gpu" | while IFS= read -r line; do
-                    local pname; pname=$(echo "$line" | awk '{print $2}')
-                    local gpuc; gpuc=$(echo "$line" | awk '{print $3}')
-                    [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
-                done
-            fi
-        done
-    fi
-    [[ ${#NODES_TO_DRAIN[@]} -eq 0 ]] && echo -e " ${GREEN}clear${NC}"
-
     echo ""
     echo -e "${CYAN}${BOLD}Rerunning last configuration:${NC}"
     echo -e "  ${CYAN}Nodes:${NC}     ${#NODE_IPS[@]} (${NODE_IPS[*]})"
     [[ "$EXECUTION_MODE" == "remote" ]] && echo -e "  ${CYAN}Control:${NC}  ${CONTROL_PLANE_IP}"
     echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
     echo -e "  ${CYAN}Key:${NC}       $(basename "$DEFAULT_SSH_KEY")"
-    [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]] && echo -e "  ${YELLOW}Drain:${NC}     ${#NODES_TO_DRAIN[@]} node(s) have GPU pods (will be evicted)"
     echo -e "  ${CYAN}Last run:${NC}  ${HIST_TIMESTAMP}"
     echo ""
     read -p "  Go? (Y/n): " rc
