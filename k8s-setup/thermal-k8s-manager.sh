@@ -960,25 +960,81 @@ run_diagnostics_menu() {
 
     NODE_IPS=(); OUTPUT_MODE="gdrive"
     DC_NAME="sea1"; ALTITUDE=220
-    EXECUTION_MODE="remote"
 
-    # [1/3] SSH key
-    echo -e "${CYAN}${BOLD}[1/3] SSH Key${NC}"
-    _pick_ssh_key || return 1
-    read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
-
-    # [2/3] Control plane
+    # [1/3] Cluster access
+    echo -e "${CYAN}${BOLD}[1/3] Cluster Access${NC}"
+    echo -e "  ${GREEN}1)${NC} SSH to control plane ${DIM}(enter IP)${NC}"
+    echo -e "  ${GREEN}2)${NC} Kubeconfig ${DIM}(paste or file path)${NC}"
     echo ""
-    echo -e "${CYAN}${BOLD}[2/3] Control Plane IP${NC}"
-    read -p "  IP: " CONTROL_PLANE_IP
-    echo -ne "  Testing: "
-    if remote_ssh "$CONTROL_PLANE_IP" "echo ok" &>/dev/null 2>&1; then
-        NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
-        echo -e "${GREEN}OK${NC}"
+    read -p "  Choice [1-2]: " access_mode
+
+    if [[ "${access_mode:-1}" == "2" ]]; then
+        # kubeconfig mode
+        EXECUTION_MODE="kubeconfig"
+        echo ""
+        echo -e "  ${GREEN}a)${NC} Paste kubeconfig ${DIM}(Ctrl+D when done)${NC}"
+        echo -e "  ${GREEN}b)${NC} File path"
+        read -p "  Choice [a/b]: " kc_mode
+        if [[ "$kc_mode" == "b" ]]; then
+            read -e -p "  Path: " kf; kf="${kf/#\~/$HOME}"
+            [[ ! -f "$kf" ]] && { log_error "File not found: $kf"; return 1; }
+            KUBECONFIG_FILE="$kf"
+        else
+            echo -e "  ${DIM}Paste kubeconfig YAML below, then press Ctrl+D:${NC}"
+            KUBECONFIG_FILE="/tmp/.thermal-kubeconfig-$$.yaml"
+            cat > "$KUBECONFIG_FILE"
+            echo ""
+            [[ ! -s "$KUBECONFIG_FILE" ]] && { log_error "Empty kubeconfig"; return 1; }
+        fi
+        # extract server IP for SSH relay (needed for result collection)
+        local api_server
+        api_server=$(grep -o 'server: *https\?://[^:]*' "$KUBECONFIG_FILE" | head -1 | sed 's|.*://||')
+        echo -ne "  Testing kubectl: "
+        if KUBECONFIG="$KUBECONFIG_FILE" kubectl cluster-info &>/dev/null 2>&1; then
+            echo -e "${GREEN}OK${NC}"
+        else
+            echo -e "${RED}FAILED${NC}"
+            log_error "Cannot connect to cluster with provided kubeconfig"
+            return 1
+        fi
+        # still need SSH for result collection
+        echo ""
+        echo -e "  ${DIM}SSH access still needed for result collection from nodes${NC}"
+        echo -e "${CYAN}${BOLD}  SSH Key${NC}"
+        _pick_ssh_key || return 1
+        read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
+        CONTROL_PLANE_IP="${api_server:-}"
+        if [[ -n "$CONTROL_PLANE_IP" ]]; then
+            echo -ne "  Testing SSH to ${CONTROL_PLANE_IP}: "
+            if remote_ssh "$CONTROL_PLANE_IP" "echo ok" </dev/null &>/dev/null 2>&1; then
+                NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
+                echo -e "${GREEN}OK${NC}"
+            else
+                echo -e "${YELLOW}not reachable via SSH${NC}"
+                read -p "  Control plane SSH IP (for result collection): " CONTROL_PLANE_IP
+                NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
+            fi
+        fi
     else
-        echo -e "${RED}FAILED${NC}"
-        log_error "Cannot SSH to $CONTROL_PLANE_IP with $(basename "$DEFAULT_SSH_KEY")"
-        return 1
+        # SSH mode
+        EXECUTION_MODE="remote"
+        echo ""
+        echo -e "${CYAN}  SSH Key${NC}"
+        _pick_ssh_key || return 1
+        read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
+
+        echo ""
+        echo -e "${CYAN}  Control Plane IP${NC}"
+        read -p "  IP: " CONTROL_PLANE_IP
+        echo -ne "  Testing: "
+        if remote_ssh "$CONTROL_PLANE_IP" "echo ok" </dev/null &>/dev/null 2>&1; then
+            NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
+            echo -e "${GREEN}OK${NC}"
+        else
+            echo -e "${RED}FAILED${NC}"
+            log_error "Cannot SSH to $CONTROL_PLANE_IP with $(basename "$DEFAULT_SSH_KEY")"
+            return 1
+        fi
     fi
 
     # auto-discover nodes
