@@ -1433,11 +1433,11 @@ parse_cli_args() {
     case "$cmd" in
         run)
             NODE_IPS=()
+            local use_all_gpu=false
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --nodes) NODE_IPS=($(echo "$2" | tr ',' ' ')); shift 2 ;;
-                    --all-gpu-nodes) check_kubectl || exit 1
-                        while read -r nn; do [[ -n "$nn" ]] && NODE_IPS+=("$nn"); done <<< "$(get_all_gpu_nodes)"; shift ;;
+                    --all-gpu-nodes) use_all_gpu=true; shift ;;
                     --control-plane) CONTROL_PLANE_IP="$2"; EXECUTION_MODE="${EXECUTION_MODE:-remote}"; shift 2 ;;
                     --kubeconfig) KUBECONFIG_FILE="$2"; EXECUTION_MODE="kubeconfig"; shift 2 ;;
                     --mode) EXECUTION_MODE="$2"; shift 2 ;;
@@ -1465,7 +1465,6 @@ parse_cli_args() {
                     *) log_error "Unknown: $1"; show_help; exit 1 ;;
                 esac
             done
-            [[ ${#NODE_IPS[@]} -eq 0 ]] && { log_error "No nodes. Use --nodes or --all-gpu-nodes"; exit 1; }
             export OUTPUT_MODE="${OUTPUT_MODE:-local}" DC_NAME="${DC_NAME:-sea1}" ALTITUDE="${ALTITUDE:-220}"
             if [[ -z "$EXECUTION_MODE" ]]; then
                 [[ -n "$CONTROL_PLANE_IP" ]] && EXECUTION_MODE="remote"
@@ -1473,6 +1472,14 @@ parse_cli_args() {
                 [[ -z "$EXECUTION_MODE" ]] && detect_execution_mode
             fi
             check_kubectl || exit 1
+            if [[ "$use_all_gpu" == true ]]; then
+                while read -r nn; do [[ -n "$nn" ]] && NODE_IPS+=("$nn"); done <<< "$(get_all_gpu_nodes)"
+            fi
+            [[ ${#NODE_IPS[@]} -eq 0 ]] && { log_error "No nodes. Use --nodes or --all-gpu-nodes"; exit 1; }
+            # map node IPs for remote mode
+            for n in "${NODE_IPS[@]}"; do
+                NODE_PUBLIC_IPS["$n"]="$CONTROL_PLANE_IP"
+            done
             kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
             launch_jobs "${NODE_IPS[@]}" ;;
         status) detect_execution_mode; view_status ;;
