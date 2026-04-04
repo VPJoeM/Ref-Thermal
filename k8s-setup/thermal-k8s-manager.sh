@@ -489,94 +489,166 @@ launch_jobs() {
         echo ""
     fi
 
-    log_info "Monitoring..."
-    monitor_jobs "$run_id" "${job_names[@]}"
+    # deploy watcher script to control plane -- handles monitor + collect + upload independently
+    deploy_watcher "$run_id" "${job_names[*]}" "${NODES_TO_UNCORDON[*]}"
 }
 
-monitor_jobs() {
-    local run_id="$1"; shift; local job_names=("$@")
-    local total=${#job_names[@]} start_time; start_time=$(date +%s)
-    while true; do
-        local completed=0 failed=0 running=0
-        for jn in "${job_names[@]}"; do
-            local jj
-            jj=$(kubectl_exec get job "$jn" -n thermal-diagnostics -o json 2>/dev/null)
-            if [[ -z "$jj" ]]; then
-                completed=$((completed+1)); continue
-            fi
-            local s; s=$(echo "$jj" | grep -o '"succeeded": *[0-9]*' | head -1 | grep -o '[0-9]*$')
-            local f; f=$(echo "$jj" | grep -o '"failed": *[0-9]*' | head -1 | grep -o '[0-9]*$')
-            if [[ "${s:-0}" -ge 1 ]]; then completed=$((completed+1))
-            elif [[ "${f:-0}" -gt 0 ]]; then failed=$((failed+1))
-            else running=$((running+1)); fi
-        done
-        local el=$(( $(date +%s) - start_time )); local m=$((el/60)) s=$((el%60))
-        printf "\r  ${CYAN}Progress:${NC} %d/%d complete | %d running | %d failed | %02d:%02d elapsed" \
-            "$completed" "$total" "$running" "$failed" "$m" "$s"
-        if [[ $((completed+failed)) -ge $total ]]; then
-            echo ""; echo ""
-            if [[ $failed -gt 0 ]]; then
-                log_warn "$failed job(s) failed"
-                for jn in "${job_names[@]}"; do
-                    local pod_name
-                    pod_name=$(kubectl_exec get pods -n thermal-diagnostics -l job-name="$jn" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-                    local pod_status
-                    pod_status=$(kubectl_exec get pod "$pod_name" -n thermal-diagnostics -o jsonpath='{.status.phase}' 2>/dev/null)
-                    if [[ "$pod_status" != "Succeeded" ]]; then
-                        local reason
-                        reason=$(kubectl_exec describe pod "$pod_name" -n thermal-diagnostics 2>/dev/null | grep -E "Warning|Error|failed|unavailable" | tail -1 | sed 's/^ *//')
-                        [[ -n "$reason" ]] && echo -e "  ${RED}✗${NC} $jn: $reason"
-                    fi
-                done
-            fi
-            log_success "All jobs finished. $completed succeeded, $failed failed."
+deploy_watcher() {
+    local run_id="$1" job_list="$2" uncordon_list="$3"
+    local rname="${DC_NAME:-thermal-run}-$(date +%Y%m%d-%H%M%S)"
+    local watcher_path="/tmp/.thermal-watcher-${run_id}.sh"
+    local watcher_log="/tmp/.thermal-watcher-${run_id}.log"
 
-            # kill any orphaned thermal processes on nodes
-            for nn in "${NODE_IPS[@]}"; do
-                node_exec "$nn" "sudo pkill -9 -f dcgmproftester; sudo pkill -9 -f thermal_diag" </dev/null 2>/dev/null &
-            done
-            wait
+    log_info "Deploying watcher to control plane..."
 
-            # uncordon nodes that were drained for this test
-            if [[ ${#NODES_TO_UNCORDON[@]} -gt 0 ]]; then
-                log_info "Uncordoning ${#NODES_TO_UNCORDON[@]} node(s)..."
-                for nn in "${NODES_TO_UNCORDON[@]}"; do
-                    kubectl_exec uncordon "$nn" >/dev/null 2>&1 && echo -e "  ${GREEN}✓${NC} $nn uncordoned" || echo -e "  ${YELLOW}!${NC} $nn uncordon failed"
-                done
-                NODES_TO_UNCORDON=()
-            fi
+    # generate the watcher script
+    local watcher_script
+    watcher_script=$(cat << 'WATCHER_HEREDOC'
+#!/bin/bash
+RUN_ID="__RUN_ID__"
+RNAME="__RNAME__"
+JOB_LIST="__JOB_LIST__"
+UNCORDON_NODES="__UNCORDON__"
+GDRIVE_FOLDER="__GDRIVE_FOLDER__"
+GDRIVE_TEAM_DRIVE="__GDRIVE_TEAM_DRIVE__"
+OUTPUT_MODE="__OUTPUT_MODE__"
+LOG="/tmp/.thermal-watcher-${RUN_ID}.log"
 
-            # save failed nodes for retry
-            if [[ $failed -gt 0 ]]; then
-                local failed_names=()
-                for jn in "${job_names[@]}"; do
-                    local jj; jj=$(kubectl_exec get job "$jn" -n thermal-diagnostics -o json 2>/dev/null)
-                    local f_cnt; f_cnt=$(echo "$jj" | grep -o '"failed": *[0-9]*' | head -1 | grep -o '[0-9]*$')
-                    if [[ "${f_cnt:-0}" -gt 0 ]]; then
-                        local nn; nn=$(echo "$jj" | grep -o '"nodeName": *"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
-                        [[ -n "$nn" ]] && failed_names+=("$nn")
-                    fi
-                done
-                if [[ ${#failed_names[@]} -gt 0 ]]; then
-                    cat > "$FAILED_NODES_FILE" << FAILEOF
-FAILED_IPS="${failed_names[*]}"
-FAIL_NFS_RUN_DIR="${NFS_RUN_DIR:-}"
-FAIL_EXECUTION_MODE="${EXECUTION_MODE}"
-FAIL_CONTROL_PLANE_IP="${CONTROL_PLANE_IP:-}"
-FAIL_SSH_USER="${DEFAULT_SSH_USER}"
-FAIL_SSH_KEY="${DEFAULT_SSH_KEY}"
-FAIL_OUTPUT_MODE="${OUTPUT_MODE}"
-FAILEOF
-                fi
-            else
-                rm -f "$FAILED_NODES_FILE"
-            fi
+log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
-            echo ""; collect_and_rollup "$run_id"
-            break
-        fi
-        sleep 10
+log "Watcher started for run $RUN_ID"
+log "Jobs: $JOB_LIST"
+log "Output: $OUTPUT_MODE"
+
+# monitor jobs
+TOTAL=$(echo $JOB_LIST | wc -w | tr -d ' ')
+while true; do
+    COMPLETED=0; FAILED=0
+    for jn in $JOB_LIST; do
+        s=$(sudo kubectl get job "$jn" -n thermal-diagnostics -o jsonpath='{.status.succeeded}' 2>/dev/null)
+        f=$(sudo kubectl get job "$jn" -n thermal-diagnostics -o jsonpath='{.status.failed}' 2>/dev/null)
+        [[ "${s:-0}" -ge 1 ]] && COMPLETED=$((COMPLETED+1))
+        [[ "${f:-0}" -gt 0 ]] && FAILED=$((FAILED+1))
     done
+    log "Progress: ${COMPLETED}/${TOTAL} complete, ${FAILED} failed"
+    [[ $((COMPLETED+FAILED)) -ge $TOTAL ]] && break
+    sleep 30
+done
+
+log "All jobs finished. ${COMPLETED} succeeded, ${FAILED} failed."
+
+# kill orphaned processes
+for nn in $(sudo kubectl get jobs -n thermal-diagnostics -l thermal-run=$RUN_ID -o jsonpath='{range .items[*]}{.spec.template.spec.nodeName}{" "}{end}' 2>/dev/null); do
+    sudo kubectl exec -n thermal-diagnostics $(sudo kubectl get pods -n thermal-diagnostics --field-selector spec.nodeName=$nn -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) -- pkill -9 -f dcgmproftester 2>/dev/null &
+done
+wait
+
+# collect results via kubectl cp
+log "Collecting results..."
+mkdir -p /tmp/.thermal-rollup-${RUN_ID}
+COLLECTED=0
+for jn in $JOB_LIST; do
+    POD=$(sudo kubectl get pods -n thermal-diagnostics -l "job-name=${jn}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    [[ -z "$POD" ]] && continue
+    NN=$(sudo kubectl get pod "$POD" -n thermal-diagnostics -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+    RZIP=$(sudo kubectl exec "$POD" -n thermal-diagnostics -- bash -c 'ls -t /root/TDAS/dcgmprof-*.zip 2>/dev/null | head -1' 2>/dev/null | tr -d '\r')
+    [[ -z "$RZIP" ]] && { log "  No results on $NN"; continue; }
+    ZB=$(basename "$RZIP")
+    ST=$(echo "$ZB" | sed -E 's/^dcgmprof-([^-]+)-.*/\1/')
+    [[ "$ST" == "$ZB" ]] && ST="UNKNOWN"
+    NZN="${NN}-${ST}.zip"
+    sudo kubectl cp "thermal-diagnostics/${POD}:${RZIP}" "/tmp/.thermal-rollup-${RUN_ID}/${NZN}" 2>/dev/null
+    if [[ -f "/tmp/.thermal-rollup-${RUN_ID}/${NZN}" ]]; then
+        SZ=$(du -h "/tmp/.thermal-rollup-${RUN_ID}/${NZN}" | cut -f1)
+        log "  Collected ${NZN} (${SZ})"
+        COLLECTED=$((COLLECTED+1))
+    else
+        log "  Failed to collect from $NN"
+    fi
+done
+
+if [[ $COLLECTED -gt 0 ]]; then
+    # create rollup
+    log "Creating rollup (${COLLECTED} nodes)..."
+    cd /tmp/.thermal-rollup-${RUN_ID} && zip -r "/tmp/${RNAME}.zip" *.zip >/dev/null 2>&1
+    ROLLUP_SZ=$(du -h "/tmp/${RNAME}.zip" | cut -f1)
+    log "Rollup: /tmp/${RNAME}.zip (${ROLLUP_SZ})"
+
+    # upload to Google Drive if gdrive mode
+    if [[ "$OUTPUT_MODE" == "gdrive" && -f /tmp/.gdrive-sa.json ]]; then
+        log "Uploading to Google Drive..."
+        sudo rclone copyto "/tmp/${RNAME}.zip" ":drive:${GDRIVE_FOLDER}/${RNAME}.zip" \
+            --drive-service-account-file /tmp/.gdrive-sa.json \
+            --drive-team-drive "${GDRIVE_TEAM_DRIVE}" \
+            --drive-scope drive 2>&1 | tee -a "$LOG"
+        if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
+            log "UPLOADED: ${GDRIVE_FOLDER}/${RNAME}.zip"
+        else
+            log "Upload failed. Rollup saved at /tmp/${RNAME}.zip"
+        fi
+    else
+        log "Results saved at /tmp/${RNAME}.zip"
+    fi
+fi
+
+# uncordon drained nodes
+if [[ -n "$UNCORDON_NODES" ]]; then
+    log "Uncordoning nodes..."
+    for nn in $UNCORDON_NODES; do
+        sudo kubectl uncordon "$nn" 2>/dev/null && log "  Uncordoned $nn"
+    done
+fi
+
+# cleanup
+rm -rf /tmp/.thermal-rollup-${RUN_ID}
+sudo kubectl delete jobs -l thermal-run=${RUN_ID} -n thermal-diagnostics 2>/dev/null
+sudo rm -f /tmp/.gdrive-sa.json
+
+log "Watcher complete."
+WATCHER_HEREDOC
+    )
+
+    # inject runtime values
+    watcher_script="${watcher_script//__RUN_ID__/$run_id}"
+    watcher_script="${watcher_script//__RNAME__/$rname}"
+    watcher_script="${watcher_script//__JOB_LIST__/$job_list}"
+    watcher_script="${watcher_script//__UNCORDON__/$uncordon_list}"
+    watcher_script="${watcher_script//__GDRIVE_FOLDER__/$GDRIVE_FOLDER}"
+    watcher_script="${watcher_script//__GDRIVE_TEAM_DRIVE__/$GDRIVE_TEAM_DRIVE}"
+    watcher_script="${watcher_script//__OUTPUT_MODE__/${OUTPUT_MODE:-local}}"
+
+    # deploy to control plane
+    echo "$watcher_script" | remote_ssh "$CONTROL_PLANE_IP" "cat > '${watcher_path}' && chmod +x '${watcher_path}'" </dev/null
+    remote_ssh "$CONTROL_PLANE_IP" "nohup sudo bash '${watcher_path}' > '${watcher_log}' 2>&1 &" </dev/null
+
+    echo ""
+    echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}  WATCHER DEPLOYED -- YOU CAN SAFELY DISCONNECT${NC}"
+    echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+    echo -e "  ${CYAN}Run ID:${NC}   ${run_id}"
+    echo -e "  ${CYAN}Nodes:${NC}    $(echo $job_list | wc -w | tr -d ' ')"
+    echo -e "  ${CYAN}Output:${NC}   ${OUTPUT_MODE}"
+    echo ""
+    echo -e "  ${DIM}The watcher on the control plane handles everything:${NC}"
+    echo -e "  ${DIM}  monitor → collect → upload → uncordon → cleanup${NC}"
+    echo ""
+    echo -e "  ${CYAN}Check progress:${NC}"
+    echo -e "    ssh ${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP} 'tail -f ${watcher_log}'"
+    echo ""
+    echo -e "  ${CYAN}Check results:${NC}"
+    echo -e "    ssh ${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP} 'cat ${watcher_log}'"
+    echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # optionally tail the log live
+    read -p "  Stay attached to watch progress? (Y/n): " watch_ans
+    if [[ ! "$watch_ans" =~ ^[Nn]$ ]]; then
+        echo -e "  ${DIM}(Ctrl+C to detach -- watcher keeps running)${NC}"
+        echo ""
+        remote_ssh "$CONTROL_PLANE_IP" "tail -f '${watcher_log}'" </dev/null 2>/dev/null || true
+        echo ""
+        log_info "Detached. Watcher still running on control plane."
+    fi
 }
 
 # ─── Results Collection ──────────────────────────────────────
@@ -1271,9 +1343,25 @@ run_diagnostics_menu() {
 
 view_status() {
     check_kubectl || return 1
-    echo -e "\n${CYAN}${BOLD}Status${NC}\n"
+    echo -e "\n${CYAN}${BOLD}Jobs${NC}\n"
     kubectl_exec get jobs -n thermal-diagnostics 2>/dev/null || echo "  No jobs"
-    echo ""; kubectl_exec get pods -n thermal-diagnostics 2>/dev/null || echo "  No pods"
+    echo -e "\n${CYAN}${BOLD}Pods${NC}\n"
+    kubectl_exec get pods -n thermal-diagnostics 2>/dev/null || echo "  No pods"
+
+    # check for watcher logs
+    if [[ -n "$CONTROL_PLANE_IP" ]]; then
+        local latest_log
+        latest_log=$(remote_ssh "$CONTROL_PLANE_IP" "ls -t /tmp/.thermal-watcher-*.log 2>/dev/null | head -1" </dev/null 2>/dev/null | tr -d '\r')
+        if [[ -n "$latest_log" ]]; then
+            echo -e "\n${CYAN}${BOLD}Watcher Log${NC} ${DIM}(${latest_log})${NC}\n"
+            remote_ssh "$CONTROL_PLANE_IP" "tail -10 '${latest_log}'" </dev/null 2>/dev/null
+            echo ""
+            read -p "  Tail live? (y/N): " tail_ans
+            if [[ "$tail_ans" =~ ^[Yy]$ ]]; then
+                remote_ssh "$CONTROL_PLANE_IP" "tail -f '${latest_log}'" </dev/null 2>/dev/null || true
+            fi
+        fi
+    fi
 }
 
 cleanup_jobs() {
