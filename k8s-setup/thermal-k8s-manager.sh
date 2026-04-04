@@ -424,8 +424,8 @@ launch_jobs() {
 
     echo -ne "  ${DIM}Applying ${#job_names[@]} jobs...${NC}"
     if [[ "$EXECUTION_MODE" == "remote" ]]; then
-        printf '%s' "$all_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
-            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f -" 2>/dev/null
+        echo "$all_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
+            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f - 2>/dev/null"
     else
         echo "$all_yaml" | kubectl_exec apply -f - 2>/dev/null
     fi
@@ -646,8 +646,8 @@ WYAML
 
     # apply watcher YAML - use raw ssh without -A to avoid stdin conflict with pipe
     if [[ "$EXECUTION_MODE" == "remote" ]]; then
-        printf '%s' "$watcher_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
-            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f -" 2>/dev/null
+        echo "$watcher_yaml" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
+            "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "sudo kubectl apply -f - 2>/dev/null"
     else
         echo "$watcher_yaml" | kubectl_exec apply -f - 2>/dev/null
     fi
