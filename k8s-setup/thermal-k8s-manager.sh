@@ -1188,20 +1188,21 @@ run_diagnostics_menu() {
         2) OUTPUT_MODE="local" ;;
     esac
 
-    # pre-flight: check for GPU pods that need draining
+    # pre-flight: check for pods with actual GPU resource limits
     NODES_TO_DRAIN=()
     for nn in "${NODE_IPS[@]}"; do
         local gpu_pods
         gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
-            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.containers[*].resources.limits}
-{end}' 2>/dev/null | grep -i "nvidia" | grep -v "thermal-diag" | head -5)
+            -o "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
+            2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag | head -5)
         if [[ -n "$gpu_pods" ]]; then
             NODES_TO_DRAIN+=("$nn")
             echo ""
             echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
             echo "$gpu_pods" | while IFS= read -r line; do
                 local pname; pname=$(echo "$line" | awk '{print $1}')
-                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname}${NC}"
+                local gpuc; gpuc=$(echo "$line" | awk '{print $2}')
+                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
             done
         fi
     done
@@ -1401,21 +1402,22 @@ rerun_last() {
     fi
     if ! check_kubectl; then return 1; fi
 
-    # check for GPU pods on target nodes
+    # check for pods with actual GPU resource limits
     NODES_TO_DRAIN=()
     echo -ne "  ${DIM}Checking nodes for GPU workloads...${NC}"
     for nn in "${NODE_IPS[@]}"; do
         local gpu_pods
         gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
-            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.containers[*].resources.limits}
-{end}' 2>/dev/null | grep -i "nvidia" | grep -v "thermal-diag" | head -5)
+            -o "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name} {range .spec.containers[*]}{.resources.limits.nvidia\.com/gpu}{end}{\"\n\"}{end}" \
+            2>/dev/null | grep -E ' [0-9]+$' | grep -v thermal-diag | head -5)
         if [[ -n "$gpu_pods" ]]; then
             NODES_TO_DRAIN+=("$nn")
             echo ""
             echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
             echo "$gpu_pods" | while IFS= read -r line; do
                 local pname; pname=$(echo "$line" | awk '{print $1}')
-                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname}${NC}"
+                local gpuc; gpuc=$(echo "$line" | awk '{print $2}')
+                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname} (${gpuc} GPU)${NC}"
             done
         fi
     done
