@@ -401,8 +401,6 @@ launch_jobs() {
     echo -e "  ${CYAN}Output:${NC}        ${OUTPUT_MODE:-local}"
     echo -e "  ${CYAN}DC Name:${NC}       ${DC_NAME:-thermal-run}"
     echo ""
-    kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || \
-        cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
 
     # resolve COLLECT_NODE to hostname if public IP given
     if [[ "${OUTPUT_MODE:-local}" == "node" && -n "${COLLECT_NODE:-}" && "$COLLECT_NODE" =~ ^[0-9]+\. ]]; then
@@ -411,14 +409,6 @@ launch_jobs() {
         log_info "Collection node: $COLLECT_NODE → $ch"
         export COLLECT_NODE="$ch"
     fi
-
-    # clean stale results + processes in parallel
-    echo -ne "  ${DIM}Cleaning nodes...${NC}"
-    for nn in "${node_ips[@]}"; do
-        node_exec "$nn" "sudo pkill -9 -f dcgmproftester 2>/dev/null; sudo pkill -9 -f thermal_diag 2>/dev/null; sudo racadm jobqueue delete -i JID_CLEARALL 2>/dev/null; sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null &
-    done
-    wait
-    echo -e " ${GREEN}✓${NC}"
 
     # generate all job YAMLs locally, apply in single kubectl call
     local all_yaml="" job_names=() job_nodes=()
