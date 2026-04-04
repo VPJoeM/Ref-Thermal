@@ -604,10 +604,10 @@ WATCHER_HEREDOC
     watcher_script="${watcher_script//__GDRIVE_TEAM_DRIVE__/$GDRIVE_TEAM_DRIVE}"
     watcher_script="${watcher_script//__OUTPUT_MODE__/${OUTPUT_MODE:-local}}"
 
-    # deploy to control plane: write script via SSH heredoc (self-contained, no SCP needed)
-    ssh -A $SSH_OPTS -i "$DEFAULT_SSH_KEY" "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" \
-        "cat > '${watcher_path}' && chmod +x '${watcher_path}'" <<< "$watcher_script"
-    remote_ssh "$CONTROL_PLANE_IP" "chmod +x '${watcher_path}' && nohup sudo bash '${watcher_path}' > '${watcher_log}' 2>&1 &" </dev/null
+    # deploy to control plane: pipe script content without agent forwarding
+    printf '%s' "$watcher_script" | ssh $SSH_OPTS -i "$DEFAULT_SSH_KEY" \
+        "${DEFAULT_SSH_USER}@${CONTROL_PLANE_IP}" "cat > '${watcher_path}' && chmod +x '${watcher_path}'"
+    remote_ssh "$CONTROL_PLANE_IP" "nohup sudo bash '${watcher_path}' > '${watcher_log}' 2>&1 &" </dev/null
 
     echo ""
     echo -e "${GREEN}${BOLD}══════════════════════════════════════════════════════════${NC}"
