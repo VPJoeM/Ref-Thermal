@@ -413,11 +413,12 @@ launch_jobs() {
     fi
 
     # clean stale results + processes in parallel
-    log_info "Preparing ${#node_ips[@]} node(s)..."
+    echo -ne "  ${DIM}Cleaning nodes...${NC}"
     for nn in "${node_ips[@]}"; do
         node_exec "$nn" "sudo pkill -9 -f dcgmproftester 2>/dev/null; sudo pkill -9 -f thermal_diag 2>/dev/null; sudo racadm jobqueue delete -i JID_CLEARALL 2>/dev/null; sudo rm -rf /root/TDAS/dcgmprof-*" </dev/null 2>/dev/null &
     done
     wait
+    echo -e " ${GREEN}✓${NC}"
 
     # create jobs on all nodes
     local job_names=() job_nodes=()
@@ -1505,8 +1506,10 @@ rerun_last() {
     echo ""
     read -p "  Go? (Y/n): " rc
     [[ "$rc" =~ ^[Nn]$ ]] && return 0
-    echo -e "\n${GREEN}${BOLD}>>> LAUNCHING -- no more prompts, sit back <<<${NC}\n"
+    echo -e "\n${GREEN}${BOLD}>>> LAUNCHING <<<${NC}\n"
+    echo -ne "  ${DIM}Setting up namespace...${NC}"
     kubectl_exec apply -f "$NAMESPACE_YAML" 2>/dev/null || cat "$NAMESPACE_YAML" | kubectl_exec apply -f - 2>/dev/null
+    echo -e " ${GREEN}✓${NC}"
     launch_jobs "${NODE_IPS[@]}"
 }
 
