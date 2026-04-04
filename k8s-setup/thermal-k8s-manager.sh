@@ -971,49 +971,133 @@ run_diagnostics_menu() {
     if [[ "${access_mode:-1}" == "2" ]]; then
         # kubeconfig mode
         EXECUTION_MODE="kubeconfig"
-        echo ""
-        echo -e "  ${GREEN}a)${NC} Paste kubeconfig ${DIM}(Ctrl+D when done)${NC}"
-        echo -e "  ${GREEN}b)${NC} File path"
-        read -p "  Choice [a/b]: " kc_mode
-        if [[ "$kc_mode" == "b" ]]; then
-            read -e -p "  Path: " kf; kf="${kf/#\~/$HOME}"
-            [[ ! -f "$kf" ]] && { log_error "File not found: $kf"; return 1; }
-            KUBECONFIG_FILE="$kf"
-        else
-            echo -e "  ${DIM}Paste kubeconfig YAML below, then press Ctrl+D:${NC}"
-            KUBECONFIG_FILE="/tmp/.thermal-kubeconfig-$$.yaml"
-            cat > "$KUBECONFIG_FILE"
-            echo ""
-            [[ ! -s "$KUBECONFIG_FILE" ]] && { log_error "Empty kubeconfig"; return 1; }
+        local kube_cache="/tmp/.thermal-kubeconfigs"
+        local kube_history="/tmp/.thermal-kubeconfig-history"
+        mkdir -p "$kube_cache" 2>/dev/null; chmod 700 "$kube_cache" 2>/dev/null
+
+        # check for saved kubeconfigs
+        local hist_items=() hist_labels=()
+        if [[ -f "$kube_history" && -s "$kube_history" ]]; then
+            while IFS='|' read -r hpath hlabel hts; do
+                [[ -z "$hpath" ]] && continue
+                [[ -f "$hpath" ]] && { hist_items+=("$hpath"); hist_labels+=("$hlabel"); }
+            done < "$kube_history"
         fi
-        # extract server IP for SSH relay (needed for result collection)
+
+        echo ""
+        if [[ ${#hist_items[@]} -gt 0 ]]; then
+            echo -e "  ${GREEN}1)${NC} Load from history ${DIM}(${#hist_items[@]} saved)${NC}"
+            echo -e "  ${GREEN}2)${NC} File path"
+            echo -e "  ${GREEN}3)${NC} Paste kubeconfig"
+            read -p "  Choice [1-3]: " kc_mode
+        else
+            echo -e "  ${GREEN}1)${NC} File path"
+            echo -e "  ${GREEN}2)${NC} Paste kubeconfig"
+            read -p "  Choice [1-2]: " kc_mode
+            [[ "$kc_mode" == "1" ]] && kc_mode="2"  # remap
+            [[ "$kc_mode" == "2" ]] && kc_mode="3"
+            [[ "$kc_mode" == "1" ]] || true
+        fi
+
+        case "$kc_mode" in
+            1)
+                echo ""
+                for i in "${!hist_items[@]}"; do
+                    echo -e "    ${GREEN}$((i+1)))${NC} ${hist_labels[$i]}"
+                done
+                read -p "  Select [1-${#hist_items[@]}]: " hc
+                if [[ "$hc" =~ ^[0-9]+$ ]] && [[ "$hc" -ge 1 ]] && [[ "$hc" -le "${#hist_items[@]}" ]]; then
+                    KUBECONFIG_FILE="${hist_items[$((hc-1))]}"
+                    echo -e "  ${GREEN}Using: ${hist_labels[$((hc-1))]}${NC}"
+                else
+                    log_error "Invalid"; return 1
+                fi
+                ;;
+            2)
+                read -e -p "  Path: " kf; kf="${kf/#\~/$HOME}"
+                [[ ! -f "$kf" ]] && { log_error "File not found: $kf"; return 1; }
+                KUBECONFIG_FILE="$kf"
+                read -p "  Name this config (e.g. 'prod-sea1'): " klbl
+                [[ -z "$klbl" ]] && klbl=$(basename "$kf")
+                echo "$KUBECONFIG_FILE|$klbl|$(date +%s)" >> "$kube_history"
+                ;;
+            3)
+                local ts; ts=$(date +%Y%m%d_%H%M%S)
+                local temp_file="/tmp/kubeconfig-paste-${ts}.yaml"
+                KUBECONFIG_FILE="${kube_cache}/kubeconfig-${ts}"
+                touch "$temp_file"; chmod 600 "$temp_file"
+
+                echo ""
+                echo -e "  ${CYAN}Paste method:${NC}"
+                echo -e "    ${GREEN}a)${NC} Open in editor ${DIM}(paste, save, close)${NC}"
+                echo -e "    ${GREEN}b)${NC} Paste here ${DIM}(Ctrl+D when done)${NC}"
+                read -p "  Choice [a/b]: " paste_mode
+
+                if [[ "$paste_mode" == "b" ]]; then
+                    echo -e "  ${DIM}Paste kubeconfig YAML, then Ctrl+D:${NC}"
+                    cat > "$temp_file"
+                    echo ""
+                else
+                    if [[ "$OSTYPE" == "darwin"* ]]; then
+                        open -t "$temp_file"
+                        echo -e "  ${CYAN}Editor opened. Paste your kubeconfig, save, close.${NC}"
+                    else
+                        ${EDITOR:-nano} "$temp_file"
+                    fi
+                    echo ""
+                    read -p "  Press Enter when done: "
+                fi
+
+                [[ ! -s "$temp_file" ]] && { log_error "Empty kubeconfig"; rm -f "$temp_file"; return 1; }
+                mv "$temp_file" "$KUBECONFIG_FILE"; chmod 600 "$KUBECONFIG_FILE"
+                local lc; lc=$(wc -l < "$KUBECONFIG_FILE" | tr -d ' ')
+                echo -e "  ${GREEN}Saved (${lc} lines)${NC}"
+
+                read -p "  Name this config (e.g. 'prod-sea1'): " klbl
+                [[ -z "$klbl" ]] && klbl="config-${ts}"
+                echo "$KUBECONFIG_FILE|$klbl|$(date +%s)" >> "$kube_history"
+                ;;
+            *) log_error "Invalid"; return 1 ;;
+        esac
+
+        # test kubeconfig
         local api_server
-        api_server=$(grep -o 'server: *https\?://[^:]*' "$KUBECONFIG_FILE" | head -1 | sed 's|.*://||')
-        echo -ne "  Testing kubectl: "
+        api_server=$(KUBECONFIG="$KUBECONFIG_FILE" kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+        echo -e "  ${CYAN}API Server:${NC} ${api_server:-unknown}"
+        echo -ne "  Testing: "
         if KUBECONFIG="$KUBECONFIG_FILE" kubectl cluster-info &>/dev/null 2>&1; then
             echo -e "${GREEN}OK${NC}"
         else
             echo -e "${RED}FAILED${NC}"
-            log_error "Cannot connect to cluster with provided kubeconfig"
+            log_error "Cannot connect with this kubeconfig"
             return 1
         fi
-        # still need SSH for result collection
+
+        # extract control plane IP for SSH relay
+        if [[ "$api_server" =~ https?://([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            CONTROL_PLANE_IP="${BASH_REMATCH[1]}"
+        fi
+
+        # SSH still needed for result collection
         echo ""
-        echo -e "  ${DIM}SSH access still needed for result collection from nodes${NC}"
-        echo -e "${CYAN}${BOLD}  SSH Key${NC}"
+        echo -e "  ${DIM}SSH needed for result collection from nodes${NC}"
+        echo -e "${CYAN}  SSH Key${NC}"
         _pick_ssh_key || return 1
         read -p "  SSH user [ubuntu]: " su; DEFAULT_SSH_USER="${su:-ubuntu}"
-        CONTROL_PLANE_IP="${api_server:-}"
+
         if [[ -n "$CONTROL_PLANE_IP" ]]; then
             echo -ne "  Testing SSH to ${CONTROL_PLANE_IP}: "
             if remote_ssh "$CONTROL_PLANE_IP" "echo ok" </dev/null &>/dev/null 2>&1; then
                 NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
                 echo -e "${GREEN}OK${NC}"
             else
-                echo -e "${YELLOW}not reachable via SSH${NC}"
-                read -p "  Control plane SSH IP (for result collection): " CONTROL_PLANE_IP
+                echo -e "${YELLOW}not reachable${NC}"
+                read -p "  Control plane SSH IP: " CONTROL_PLANE_IP
                 NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
             fi
+        else
+            read -p "  Control plane SSH IP (for node access): " CONTROL_PLANE_IP
+            NODE_CONNECT["$CONTROL_PLANE_IP"]="direct"
         fi
     else
         # SSH mode
