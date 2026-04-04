@@ -604,8 +604,9 @@ WATCHER_HEREDOC
     watcher_script="${watcher_script//__GDRIVE_TEAM_DRIVE__/$GDRIVE_TEAM_DRIVE}"
     watcher_script="${watcher_script//__OUTPUT_MODE__/${OUTPUT_MODE:-local}}"
 
-    # deploy to control plane
-    echo "$watcher_script" | remote_ssh "$CONTROL_PLANE_IP" "cat > '${watcher_path}' && chmod +x '${watcher_path}'" </dev/null
+    # deploy to control plane via base64 to avoid pipe/stdin conflicts
+    local watcher_b64; watcher_b64=$(echo "$watcher_script" | base64)
+    remote_ssh "$CONTROL_PLANE_IP" "echo '${watcher_b64}' | base64 -d > '${watcher_path}' && chmod +x '${watcher_path}'" </dev/null
     remote_ssh "$CONTROL_PLANE_IP" "nohup sudo bash '${watcher_path}' > '${watcher_log}' 2>&1 &" </dev/null
 
     echo ""
