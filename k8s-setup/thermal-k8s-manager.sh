@@ -59,6 +59,7 @@ declare -A IP_MAP_INTERNAL
 declare -A IP_MAP_HOSTNAME
 declare -A NODE_PUBLIC_IPS
 declare -A NODE_CONNECT    # ip -> "direct" or "proxy:private_ip"
+NODES_TO_DRAIN=()          # nodes needing drain before test
 NODES_TO_UNCORDON=()       # nodes drained pre-test, uncordoned post-test
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
@@ -424,48 +425,22 @@ launch_jobs() {
     done
     wait
 
-    # pre-flight: check for GPU-consuming pods on target nodes, drain if needed
-    local needs_drain=()
-    for nn in "${node_ips[@]}"; do
-        local gpu_pods
-        gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
-            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.containers[*].resources.limits}
-{end}' 2>/dev/null | grep -i "nvidia" | grep -v "thermal-diag" | head -5)
-        if [[ -n "$gpu_pods" ]]; then
-            needs_drain+=("$nn")
-            echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads running:"
-            echo "$gpu_pods" | while IFS= read -r line; do
-                local pname; pname=$(echo "$line" | awk '{print $1}')
-                echo -e "      ${DIM}${pname}${NC}"
-            done
-        fi
-    done
-
-    if [[ ${#needs_drain[@]} -gt 0 ]]; then
-        echo ""
-        echo -e "  ${YELLOW}${BOLD}${#needs_drain[@]} node(s) have GPU pods that will block the thermal test.${NC}"
-        echo -e "  ${DIM}These nodes need to be drained (existing pods evicted) before testing.${NC}"
-        echo -e "  ${DIM}Nodes will be uncordoned automatically after the test completes.${NC}"
-        echo ""
-        read -p "  Drain these nodes and continue? (Y/n): " drain_ans
-        if [[ "$drain_ans" =~ ^[Nn]$ ]]; then
-            log_error "Cannot run thermal test with GPU pods occupying the nodes"
-            return 1
-        fi
-
-        for nn in "${needs_drain[@]}"; do
+    # drain nodes that have GPU workloads (detected during wizard)
+    if [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]]; then
+        log_info "Draining ${#NODES_TO_DRAIN[@]} node(s) with GPU workloads..."
+        for nn in "${NODES_TO_DRAIN[@]}"; do
             echo -ne "  ${YELLOW}→${NC} Draining ${nn}..."
             kubectl_exec cordon "$nn" >/dev/null 2>&1
             kubectl_exec drain "$nn" --ignore-daemonsets --delete-emptydir-data --force --timeout=120s >/dev/null 2>&1
             if [[ $? -eq 0 ]]; then
                 echo -e " ${GREEN}✓${NC}"
             else
-                echo -e " ${YELLOW}partial${NC} (some pods may remain)"
+                echo -e " ${YELLOW}partial${NC}"
             fi
         done
+        NODES_TO_UNCORDON=("${NODES_TO_DRAIN[@]}")
+        NODES_TO_DRAIN=()
         echo ""
-        log_info "Nodes drained. Will uncordon after test completes."
-        NODES_TO_UNCORDON=("${needs_drain[@]}")
     fi
 
     local job_names=() job_nodes=()
@@ -1206,6 +1181,24 @@ run_diagnostics_menu() {
         2) OUTPUT_MODE="local" ;;
     esac
 
+    # pre-flight: check for GPU pods that need draining
+    NODES_TO_DRAIN=()
+    for nn in "${NODE_IPS[@]}"; do
+        local gpu_pods
+        gpu_pods=$(kubectl_exec get pods --all-namespaces --field-selector "spec.nodeName=${nn}" \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.spec.containers[*].resources.limits}
+{end}' 2>/dev/null | grep -i "nvidia" | grep -v "thermal-diag" | head -5)
+        if [[ -n "$gpu_pods" ]]; then
+            NODES_TO_DRAIN+=("$nn")
+            echo ""
+            echo -e "  ${YELLOW}⚠${NC}  ${nn} has GPU workloads:"
+            echo "$gpu_pods" | while IFS= read -r line; do
+                local pname; pname=$(echo "$line" | awk '{print $1}')
+                [[ -n "$pname" ]] && echo -e "      ${DIM}${pname}${NC}"
+            done
+        fi
+    done
+
     # summary
     echo ""
     echo -e "${BLUE}${BOLD}══════════════════════════════════════════════════════════${NC}"
@@ -1216,6 +1209,9 @@ run_diagnostics_menu() {
     echo -e "  ${CYAN}Key:${NC}       $(basename "$DEFAULT_SSH_KEY")"
     echo -e "  ${CYAN}Site:${NC}      ${DC_NAME} (${ALTITUDE} ft)"
     echo -e "  ${CYAN}Output:${NC}    ${OUTPUT_MODE}"
+    if [[ ${#NODES_TO_DRAIN[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}Drain:${NC}     ${#NODES_TO_DRAIN[@]} node(s) have GPU pods (will be evicted)"
+    fi
     echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
     echo ""
     read -p "  Ready to go? (Y/n): " lc
@@ -1647,27 +1643,8 @@ ENTRYPT
 
 # ─── Entry Point ──────────────────────────────────────────────
 
-# auto-launch inside screen so the run survives disconnects
-if [[ -z "${STY:-}" && -z "${THERMAL_IN_SCREEN:-}" ]]; then
-    if ! command -v screen &>/dev/null; then
-        echo "Installing screen..."
-        if command -v brew &>/dev/null; then
-            brew install screen >/dev/null 2>&1
-        elif command -v apt-get &>/dev/null; then
-            sudo apt-get install -y screen >/dev/null 2>&1
-        fi
-    fi
-    if command -v screen &>/dev/null; then
-        SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-        echo ""
-        echo -e "\033[0;36mStarting in screen session 'thermal-k8s'...\033[0m"
-        echo -e "\033[2m  • Detach anytime:  Ctrl+A then D"
-        echo -e "  • Reattach:        screen -r thermal-k8s\033[0m"
-        echo ""
-        sleep 2
-        exec screen -S thermal-k8s bash -c "THERMAL_IN_SCREEN=1 bash '$SCRIPT_PATH' $*; echo ''; echo 'Press Enter to exit screen...'; read"
-    fi
-fi
+# screen disabled for K8s version -- kubectl handles long-running jobs natively
+# the test runs as K8s Jobs so disconnecting won't kill it
 
 # run extraction
 extract_embedded_files
