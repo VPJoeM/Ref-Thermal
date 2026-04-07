@@ -4,7 +4,7 @@
 # Folder should contain: hostname-ServiceTag.zip files
 # Folder name is used as DC identifier (e.g. sea1, iad1, dfw1)
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 GDRIVE_TEAM_DRIVE="0AEnvoKAUzsPmUk9PVA"
 GDRIVE_BASE_FOLDER="thermal-results"
 GDRIVE_PASS_FILE="/tmp/.thermal-gdrive-pass"
@@ -101,15 +101,59 @@ echo -e "${BOLD}═════════════════════�
 echo ""
 
 # validate file names look correct (hostname-ServiceTag.zip)
-bad=0
+bad_names=0
 for z in "${ZIPS[@]}"; do
     bn=$(basename "$z")
     if [[ ! "$bn" =~ ^[a-z0-9]+-[A-Z0-9]+\.zip$ ]]; then
         log_warn "Unexpected filename format: $bn (expected hostname-ServiceTag.zip)"
-        bad=$((bad + 1))
+        bad_names=$((bad_names + 1))
     fi
 done
-[[ $bad -gt 0 ]] && echo ""
+[[ $bad_names -gt 0 ]] && echo ""
+
+# check for tensor_active results in each zip (GPU stress test output)
+echo -e "${CYAN}Validating GPU stress test results (tensor_active)...${NC}"
+missing_tensor=()
+has_tensor=()
+
+for z in "${ZIPS[@]}"; do
+    bn=$(basename "$z")
+    # check if zip contains tensor_active files
+    if unzip -l "$z" 2>/dev/null | grep -q "tensor_active"; then
+        has_tensor+=("$z")
+    else
+        missing_tensor+=("$bn")
+    fi
+done
+
+echo -e "  ${GREEN}✓${NC} ${#has_tensor[@]} files have tensor_active results"
+
+if [[ ${#missing_tensor[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${RED}${BOLD}WARNING: ${#missing_tensor[@]} files MISSING tensor_active results:${NC}"
+    echo -e "${DIM}These zips may have incomplete GPU stress tests (dcgmproftester failed)${NC}"
+    echo ""
+    for mf in "${missing_tensor[@]}"; do
+        echo -e "  ${RED}✗${NC} $mf"
+    done
+    echo ""
+    echo -e "${YELLOW}Possible causes:${NC}"
+    echo -e "  - DCGM version mismatch (check dcgmproftester.log in zip)"
+    echo -e "  - GPU was busy during test"
+    echo -e "  - Test was interrupted"
+    echo ""
+    read -rp "Upload files WITH tensor_active only? [Y/n]: " skip_bad
+    if [[ ! "$skip_bad" =~ ^[Nn]$ ]]; then
+        ZIPS=("${has_tensor[@]}")
+        TOTAL=${#ZIPS[@]}
+        log_info "Uploading ${TOTAL} validated files only"
+    else
+        log_warn "Uploading ALL files including those without tensor_active"
+    fi
+    echo ""
+fi
+
+[[ $TOTAL -eq 0 ]] && { log_error "No valid files to upload"; exit 1; }
 
 uploaded=0; failed=0
 
@@ -143,5 +187,6 @@ if [[ $uploaded -gt 0 ]]; then
     echo -e "  ${CYAN}Location:${NC}    ${DRIVE_FOLDER}/"
 fi
 [[ $failed -gt 0 ]] && echo -e "  ${RED}Failed:${NC}      ${failed} files"
+[[ ${#missing_tensor[@]} -gt 0 ]] && echo -e "  ${YELLOW}Skipped:${NC}     ${#missing_tensor[@]} files (missing tensor_active)"
 echo -e "${BOLD}══════════════════════════════════════════════════════════${NC}"
 echo ""
